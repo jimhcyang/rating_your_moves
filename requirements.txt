@@ -1,0 +1,13 @@
+# Core data + utilities
+pandas
+numpy
+tqdm
+python-chess
+zstandard
+requests
+pyarrow
+matplotlib
+
+# For models (you’ll use these later)
+torch
+transformers
