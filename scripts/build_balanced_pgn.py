@@ -1,4 +1,3 @@
-# scripts/build_balanced_pgn.py
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -82,7 +81,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Number of games per rating band. If omitted, uses the minimum "
-            "available across all bands."
+            "available across all bands. If provided together with "
+            "--drop-underfull-bands, bands with fewer than this many games "
+            "are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--drop-underfull-bands",
+        action="store_true",
+        help=(
+            "If set and --per-band is specified, drop rating bands that have "
+            "fewer than --per-band games instead of shrinking per-band."
         ),
     )
     parser.add_argument(
@@ -154,7 +163,7 @@ def prepare_rating_column(
     Prepare the rating column to be used for banding.
 
     - If rating_col == 'avg_elo', require both white_elo and black_elo, compute
-      avg_elo, and (optionally) drop games with huge rating gaps later if desired.
+      avg_elo, and drop games with huge rating gaps (>|2*bin_size|).
     - Else, just drop rows where rating_col is NaN.
     """
     df = df.copy()
@@ -174,7 +183,7 @@ def prepare_rating_column(
             df["white_elo"].astype(float) + df["black_elo"].astype(float)
         ) / 2.0
 
-        # Optional: drop extreme rating differences like in index_stats
+        # Drop extreme rating differences like in index_stats
         rating_diff = (
             df["white_elo"].astype(float) - df["black_elo"].astype(float)
         ).abs()
@@ -208,31 +217,57 @@ def sample_balanced_by_band(
     band_labels: List[str],
     per_band: int | None,
     seed: int,
+    drop_underfull_bands: bool,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
     Given a DF with a 'rating_band' column and band_labels in numeric order,
-    sample per_band games from each band (or min count across bands if per_band
-    is None). Returns the balanced DF and a dict of band -> sampled count.
+    sample per_band games from each band.
+
+    If per_band is None:
+        - per_band = min(counts across all bands with at least 1 game).
+
+    If per_band is not None and drop_underfull_bands=False:
+        - If per_band > min_available, shrink per_band to min_available
+          (old behaviour).
+
+    If per_band is not None and drop_underfull_bands=True:
+        - Keep per_band as requested.
+        - Drop/skips bands with fewer than per_band games.
+
+    Returns the balanced DF and a dict of band -> sampled count.
     """
     counts = df["rating_band"].value_counts()
-    # Only consider bands actually present in band_labels
     counts = counts.reindex(band_labels, fill_value=0)
 
     print("\n[balance] Band counts before sampling:")
     for band, c in counts.items():
         print(f"  {band}: {c}")
 
+    # Decide per_band
     if per_band is None:
-        per_band = int(counts.min())
+        # Use the smallest non-zero band as cap
+        non_zero_counts = counts[counts > 0]
+        if non_zero_counts.empty:
+            raise ValueError("[balance] No non-empty rating bands found.")
+        per_band = int(non_zero_counts.min())
         print(f"[balance] Using per-band size = min count across bands = {per_band}")
+        effective_drop_underfull = False
     else:
-        min_available = int(counts.min())
-        if per_band > min_available:
+        min_available = int(counts[counts > 0].min()) if (counts > 0).any() else 0
+        if drop_underfull_bands:
             print(
-                f"[balance] Requested per-band={per_band}, but smallest band has only {min_available}."
+                f"[balance] Requested per-band={per_band} with --drop-underfull-bands; "
+                "bands with fewer games will be skipped."
             )
-            print(f"[balance] Reducing per-band to {min_available}.")
-            per_band = min_available
+            effective_drop_underfull = True
+        else:
+            if per_band > min_available:
+                print(
+                    f"[balance] Requested per-band={per_band}, but smallest band has only {min_available}."
+                )
+                print(f"[balance] Reducing per-band to {min_available}.")
+                per_band = min_available
+            effective_drop_underfull = False
 
     rng = np.random.default_rng(seed)
     sampled_frames: List[pd.DataFrame] = []
@@ -240,17 +275,27 @@ def sample_balanced_by_band(
 
     for band in band_labels:
         band_df = df[df["rating_band"] == band]
-        if band_df.empty:
+        band_count = len(band_df)
+        if band_count == 0:
             continue
-        if len(band_df) < per_band:
-            # Should not happen with logic above, but be safe
-            n = len(band_df)
-        else:
-            n = per_band
+
+        if effective_drop_underfull and band_count < per_band:
+            print(
+                f"[balance] Skipping band {band} (only {band_count} < per-band={per_band})."
+            )
+            continue
+
+        n = min(per_band, band_count)
         idx = rng.choice(band_df.index.to_numpy(), size=n, replace=False)
         sampled = band_df.loc[idx]
         sampled_frames.append(sampled)
         sampled_counts[band] = n
+
+    if not sampled_frames:
+        raise ValueError(
+            "[balance] No bands met the per-band requirement; try lowering --per-band "
+            "or disabling --drop-underfull-bands."
+        )
 
     balanced_df = pd.concat(sampled_frames, ignore_index=True)
 
@@ -320,7 +365,8 @@ def write_pgn_for_index(df: pd.DataFrame, out_path: Path) -> None:
         print(f"[balance] No games to write for {out_path.name}.")
         return
 
-    if not {"pgn_path", "start_offset", "end_offset"}.issubset(df.columns):
+    required_cols = {"pgn_path", "start_offset", "end_offset"}
+    if not required_cols.issubset(df.columns):
         raise ValueError(
             "DF must contain 'pgn_path', 'start_offset', 'end_offset' columns."
         )
@@ -411,6 +457,7 @@ def main() -> None:
         band_labels=band_labels,
         per_band=args.per_band,
         seed=args.seed,
+        drop_underfull_bands=args.drop_underfull_bands,
     )
 
     # Decide output prefix
@@ -425,14 +472,14 @@ def main() -> None:
 
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save balanced index
-    index_path = out_prefix.with_suffix("_index.parquet")
+    # Save balanced index (Parquet)
+    index_path = out_prefix.parent / f"{out_prefix.name}_index.parquet"
     balanced_df.to_parquet(index_path, index=False)
     print(f"[balance] Saved balanced index to {index_path}")
 
     # If no-split, just write one PGN
-    if args.no_splt if hasattr(args, "no_splt") else args.no_split:
-        pgn_path = out_prefix.with_suffix(".pgn")
+    if args.no_split:
+        pgn_path = out_prefix.parent / f"{out_prefix.name}.pgn"
         write_pgn_for_index(balanced_df, pgn_path)
         return
 
@@ -445,9 +492,9 @@ def main() -> None:
         seed=args.seed,
     )
 
-    write_pgn_for_index(train_df, out_prefix.with_suffix("_train.pgn"))
-    write_pgn_for_index(val_df, out_prefix.with_suffix("_val.pgn"))
-    write_pgn_for_index(test_df, out_prefix.with_suffix("_test.pgn"))
+    write_pgn_for_index(train_df, out_prefix.parent / f"{out_prefix.name}_train.pgn")
+    write_pgn_for_index(val_df, out_prefix.parent / f"{out_prefix.name}_val.pgn")
+    write_pgn_for_index(test_df, out_prefix.parent / f"{out_prefix.name}_test.pgn")
 
 
 if __name__ == "__main__":
@@ -455,11 +502,12 @@ if __name__ == "__main__":
 
 """
 python -m scripts.build_balanced_pgn 2017-04 \
-  --where 'has_eval and has_clock' \
+  --where "time_control == '600+0'" \
   --rating-col avg_elo \
   --bin-size 100 \
   --seed 64 \
-  --per-band 5000 \
+  --per-band 1000 \
+  --drop-underfull-bands \
   --train-frac 0.8 --val-frac 0.1 --test-frac 0.1 \
-  --out-prefix data/rym_2017-04_eval_clock
+  --out-prefix data/rym_2017-04_bin_1000
 """

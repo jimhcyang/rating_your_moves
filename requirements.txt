@@ -7,6 +7,7 @@ zstandard
 requests
 pyarrow
 matplotlib
+imageio
 
 # For models (you’ll use these later)
 torch
