@@ -322,19 +322,3 @@ def get_model(
 
     # Should be unreachable
     raise AssertionError("Unknown model_type")
-
-"""
-python -m scripts.run_rym_baselines \
---pgn-prefix data/rym_2017-04_bin_1000 \
---npz-prefix data/rym_2017-04 \
---min-rating 800 \
---max-rating 2300 \
---num-bins 15 \
---models all \
---config-id 0 \
---epochs 16 \
---batch-size 64 \
---device mps \
---alpha-reg 100 \
---save-dir models/rym_2017-04_baselines
-"""

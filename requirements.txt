@@ -1,14 +1,26 @@
-# Core data + utilities
-pandas
-numpy
-tqdm
-python-chess
-zstandard
-requests
-pyarrow
-matplotlib
-imageio
+# Rating Your Moves (RYM) environment
+# Python 3.11, Windows 11, RTX 5090, CUDA 12.9
 
-# For models (you’ll use these later)
-torch
-transformers
+# ============================================================================
+# INSTALL PYTORCH FIRST WITH THIS COMMAND:
+#   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+# ============================================================================
+
+# --- Core data & utilities ---
+numpy==2.3.3
+pandas==2.3.3
+tqdm==4.67.1
+python-chess==1.999
+zstandard==0.23.0
+requests==2.32.3
+pyarrow==18.1.0
+matplotlib==3.10.0
+imageio==2.37.0
+
+# --- Jupyter / notebook stack ---
+jupyterlab==4.3.4
+notebook==7.3.2
+ipykernel==6.29.5
+
+# --- Hugging Face transformers ---
+transformers==4.47.1

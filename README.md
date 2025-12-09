@@ -550,7 +550,7 @@ python -m scripts.train_rym \
   --epochs 10 \
   --lr 1e-3 \
   --alpha-reg 1.0 \
-  --device mps \
+  --device cuda \
   --save-path models/rym_2017-04_baselines/rym_resnet_cfg0.pt
 ```
 
@@ -659,7 +659,7 @@ python -m scripts.run_rym_experiments \
   --epochs 5 \
   --lr 1e-3 \
   --alpha-reg 1.0 \
-  --device mps \
+  --device cuda \
   --save-dir models/rym_2017-04_baselines
 ```
 
@@ -809,7 +809,7 @@ python -m scripts.inspect_rym_game \
   --test-pgn my_games_rapid.pgn \
   --models-dir models/rym_2017-04_baselines \
   --config-id 0 \
-  --device mps \
+  --device cuda \
   --out-dir plots/rym_my_games
 ```
 
@@ -895,7 +895,7 @@ Putting everything together, a typical workflow looks like:
      --epochs 5 \
      --lr 1e-3 \
      --alpha-reg 1.0 \
-     --device mps \
+     --device cuda \
      --save-dir models/rym_2017-04_baselines
    ```
 
@@ -907,7 +907,7 @@ Putting everything together, a typical workflow looks like:
      --test-pgn data/rym_2017-04_bin_1000_test.pgn \
      --models-dir models/rym_2017-04_baselines \
      --config-id 0 \
-     --device mps \
+     --device cuda \
      --out-dir plots/rym_inspect
    ```
 
@@ -918,7 +918,7 @@ Putting everything together, a typical workflow looks like:
      --test-pgn my_own_games.pgn \
      --models-dir models/rym_2017-04_baselines \
      --config-id 0 \
-     --device mps \
+     --device cuda \
      --out-dir plots/rym_my_games
    ```
 

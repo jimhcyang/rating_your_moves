@@ -24,11 +24,15 @@ from .ply_features import NUM_PLANES  # type: ignore
 
 
 def auto_device() -> str:
-    """Pick a reasonable default device string."""
-    if torch.backends.mps.is_available():  # type: ignore[attr-defined]
-        return "mps"
+    """
+    Pick a default device.
+    We prefer CUDA (GPU) if available, then MPS on Apple Silicon, then CPU.
+    """
     if torch.cuda.is_available():
         return "cuda"
+    # Guard against torch.backends.mps not existing on non-Apple builds
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
@@ -317,7 +321,7 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default=auto_device(),
-        help="Torch device string, e.g. 'mps', 'cuda', or 'cpu'.",
+        help="Device to use: 'cuda', 'mps', or 'cpu'. Defaults to a sensible choice.",
     )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -479,6 +483,6 @@ python -m scripts.run_rym_experiments \
 --config-id all \
 --epochs 5 \
 --batch-size 256 \
---device mps \
+--device cuda \
 --save-dir models/rym_2017-04_baselines
 """

@@ -21,10 +21,14 @@ from .build_rym_npz import pgn_to_npz  # type: ignore
 
 
 def auto_device() -> str:
-    if torch.backends.mps.is_available():  # type: ignore[attr-defined]
-        return "mps"
+    """
+    Pick a default device.
+    We prefer CUDA (GPU) if available, then MPS on Apple Silicon, then CPU.
+    """
     if torch.cuda.is_available():
         return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 
@@ -554,6 +558,6 @@ python -m scripts.inspect_rym_game \
 --test-pgn my_games_rapid.pgn \
 --models-dir models/rym_2017-04_baselines \
 --config-id 0 \
---device mps \
+--device cuda \
 --out-dir plots/rym_my_games
 """
