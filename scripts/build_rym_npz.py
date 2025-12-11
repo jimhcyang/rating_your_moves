@@ -9,15 +9,17 @@ from typing import Optional, List
 import numpy as np
 import chess
 import chess.pgn
+from tqdm import tqdm
 
 from .ply_features import encode_ply_planes, NUM_PLANES  # type: ignore
 
 # ---------------------------------------------------------------------
-# Paths
+# Paths / logging
 # ---------------------------------------------------------------------
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # .../src
 DATA_DIR = ROOT_DIR / "data"
+LOG_INTERVAL_GAMES = 100_000
 
 
 # ---------------------------------------------------------------------
@@ -80,7 +82,7 @@ def rating_to_band(
 
 
 # ---------------------------------------------------------------------
-# PGN → NPZ conversion
+# PGN → NPZ (monolithic version – OK for small PGNs)
 # ---------------------------------------------------------------------
 
 
@@ -94,18 +96,18 @@ def pgn_to_npz(
     num_bins: int,
 ) -> None:
     """
-    Convert a PGN of balanced games into an NPZ of per-ply tensors.
+    Convert a PGN of (typically balanced) games into a single NPZ of per-ply tensors.
 
     Each ply is encoded using encode_ply_planes(board, move) which returns
     a (NUM_PLANES, 8, 8) uint8 tensor.
 
     The output NPZ contains:
 
-        X        : uint8, shape (N, NUM_PLANES, 8, 8)
-        y_bin    : int16, shape (N,)   # band index in [0, num_bins-1]
-        y_elo    : float32, shape (N,) # average Elo used for banding
-        game_id  : int32, shape (N,)   # 0-based game index within this PGN
-        ply_idx  : int16, shape (N,)   # 0-based ply index within that game
+        X        : uint8,  shape (N, NUM_PLANES, 8, 8)
+        y_bin    : int16,  shape (N,)   # band index in [0, num_bins-1]
+        y_elo    : float32,shape (N,)   # average Elo used for banding
+        game_id  : int32, shape (N,)    # 0-based game index within this PGN
+        ply_idx  : int16, shape (N,)    # 0-based ply index within that game
 
         num_bins   : int16
         min_rating : int16
@@ -130,7 +132,10 @@ def pgn_to_npz(
     games_used = 0
     plies_used = 0
 
-    with pgn_path.open("r", encoding="utf-8") as f:
+    with pgn_path.open("r", encoding="utf-8") as f, tqdm(
+        desc=f"Scanning games in {pgn_path.name}",
+        unit="game",
+    ) as pbar:
         while True:
             if max_games is not None and games_seen >= max_games:
                 break
@@ -138,7 +143,9 @@ def pgn_to_npz(
             game = chess.pgn.read_game(f)
             if game is None:
                 break
+
             games_seen += 1
+            pbar.update(1)
 
             avg_elo = parse_avg_elo(game)
             if avg_elo is None:
@@ -154,7 +161,7 @@ def pgn_to_npz(
             board = game.board()
             ply_idx = 0
 
-            # Iterate mainline moves only; side-to-move handled by encoder
+            # Iterate mainline moves only
             for move in game.mainline_moves():
                 planes = encode_ply_planes(board, move)  # (NUM_PLANES, 8, 8)
                 X_list.append(planes.astype(np.uint8))
@@ -169,7 +176,7 @@ def pgn_to_npz(
 
             games_used += 1
 
-            if games_seen % 1000 == 0:
+            if games_seen % LOG_INTERVAL_GAMES == 0:
                 log.info(
                     "Scanned %d games (kept %d), collected %d plies...",
                     games_seen,
@@ -210,6 +217,168 @@ def pgn_to_npz(
 
 
 # ---------------------------------------------------------------------
+# PGN → NPZ shards (memory-friendly for huge PGNs)
+# ---------------------------------------------------------------------
+
+
+def pgn_to_npz_shards(
+    pgn_path: Path,
+    out_prefix: Path,
+    *,
+    max_games: Optional[int],
+    min_rating: int,
+    max_rating: int,
+    num_bins: int,
+    chunk_games: int,
+) -> List[Path]:
+    """
+    Sharded version of pgn_to_npz.
+
+    Reads `pgn_path` once and writes multiple NPZ files, each containing
+    at most `chunk_games` *used* games worth of plies.
+
+    Output files are named:
+
+        <out_prefix>_shard000.npz
+        <out_prefix>_shard001.npz
+        ...
+
+    Returns the list of written shard paths.
+    """
+    log = logging.getLogger("build_rym_npz")
+
+    if chunk_games <= 0:
+        raise ValueError(f"chunk_games must be > 0, got {chunk_games}")
+
+    pgn_path = Path(pgn_path)
+    out_prefix = Path(out_prefix)
+
+    shard_paths: List[Path] = []
+
+    games_seen_total = 0   # how many games we've read from the PGN
+    games_used_total = 0   # how many games actually encoded
+    plies_total = 0
+    shard_idx = 0
+    eof = False
+
+    with pgn_path.open("r", encoding="utf-8") as f, tqdm(
+        desc=f"Scanning games in {pgn_path.name}",
+        unit="game",
+    ) as pbar:
+        while not eof:
+            # Per-shard buffers
+            X_list: list[np.ndarray] = []
+            y_bin_list: list[int] = []
+            y_elo_list: list[float] = []
+            game_ids: list[int] = []
+            ply_ids: list[int] = []
+
+            games_used_chunk = 0
+
+            while True:
+                # Respect overall max_games (if set)
+                if max_games is not None and games_seen_total >= max_games:
+                    eof = True
+                    break
+
+                game = chess.pgn.read_game(f)
+                if game is None:
+                    eof = True
+                    break
+
+                games_seen_total += 1
+                pbar.update(1)
+
+                avg_elo = parse_avg_elo(game)
+                if avg_elo is None:
+                    continue
+
+                band_idx = rating_to_band(
+                    avg_elo,
+                    min_rating=min_rating,
+                    max_rating=max_rating,
+                    num_bins=num_bins,
+                )
+
+                game_id = games_used_total  # global index for this PGN
+                board = game.board()
+                ply_idx = 0
+
+                for move in game.mainline_moves():
+                    feat_planes = encode_ply_planes(board, move)
+                    X_list.append(feat_planes.astype(np.uint8))
+                    y_bin_list.append(band_idx)
+                    y_elo_list.append(float(avg_elo))
+                    game_ids.append(game_id)
+                    ply_ids.append(ply_idx)
+
+                    board.push(move)
+                    ply_idx += 1
+
+                games_used_total += 1
+                games_used_chunk += 1
+                plies_total += ply_idx
+
+                if games_used_chunk >= chunk_games:
+                    # Finish this shard; outer loop will start the next one
+                    break
+
+            if not X_list:
+                # No plies collected in this shard (EOF or all games skipped)
+                break
+
+            # Stack and write this shard
+            X = np.stack(X_list, axis=0).astype(np.uint8)
+            y_bin = np.asarray(y_bin_list, dtype=np.int16)
+            y_elo = np.asarray(y_elo_list, dtype=np.float32)
+            game_id_arr = np.asarray(game_ids, dtype=np.int32)
+            ply_idx_arr = np.asarray(ply_ids, dtype=np.int16)
+
+            out_path = out_prefix.with_name(
+                f"{out_prefix.name}_shard{shard_idx:03d}.npz"
+            )
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                out_path,
+                X=X,
+                y_bin=y_bin,
+                y_elo=y_elo,
+                game_id=game_id_arr,
+                ply_idx=ply_idx_arr,
+                num_bins=np.int16(num_bins),
+                min_rating=np.int16(min_rating),
+                max_rating=np.int16(max_rating),
+            )
+
+            shard_paths.append(out_path)
+            log.info(
+                "Shard %d written: %s  | %d games in shard, %d plies in shard, "
+                "%d games used total (of %d seen), %d plies total",
+                shard_idx,
+                out_path,
+                games_used_chunk,
+                X.shape[0],
+                games_used_total,
+                games_seen_total,
+                plies_total,
+            )
+
+            shard_idx += 1
+
+    log.info(
+        "Finished sharding %s: %d shards, %d games used (of %d seen), %d plies total",
+        pgn_path.name,
+        shard_idx,
+        games_used_total,
+        games_seen_total,
+        plies_total,
+    )
+
+    return shard_paths
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
@@ -219,22 +388,22 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Convert a (balanced) PGN into an NPZ of per-ply RYM tensors.\n\n"
             "Example:\n"
-            "  python -m scripts.build_rym_npz data/rym_2017-04_bin_1000_train.pgn \\\n"
-            "    --out data/rym_2017-04_train.npz --min-rating 800 --max-rating 2400 \\\n"
-            "    --num-bins 15\n"
+            "  python -m scripts.build_rym_npz data/rym_2025-01_bin_1000_train.pgn \\\n"
+            "    --out data/rym_2025-01_train.npz --min-rating 400 --max-rating 2400 \\\n"
+            "    --num-bins 10\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "pgn",
         type=str,
-        help="Input PGN file (e.g. data/rym_2017-04_bin_1000_train.pgn).",
+        help="Input PGN file (e.g. data/rym_2025-01_bin_1000_train.pgn).",
     )
     parser.add_argument(
         "--out",
         type=str,
         required=True,
-        help="Output NPZ path (e.g. data/rym_2017-04_train.npz).",
+        help="Output NPZ path (e.g. data/rym_2025-01_train.npz).",
     )
     parser.add_argument(
         "--max-games",
@@ -245,7 +414,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-rating",
         type=int,
-        default=800,
+        default=400,
         help="Minimum rating edge for bands (inclusive).",
     )
     parser.add_argument(
@@ -257,7 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-bins",
         type=int,
-        default=15,
+        default=10,
         help="Number of rating bands between min-rating and max-rating.",
     )
     return parser.parse_args()
@@ -279,6 +448,7 @@ def main() -> None:
     if args.max_rating <= args.min_rating:
         raise ValueError("max-rating must be > min-rating")
 
+    # CLI uses monolithic conversion; for huge PGNs, prefer calling pgn_to_npz_shards
     pgn_to_npz(
         pgn_path,
         out_path,
@@ -291,14 +461,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-"""
-python -m scripts.build_rym_npz data/rym_2017-04_bin_1000_train.pgn \
---out data/rym_2017-04_train.npz
-
-python -m scripts.build_rym_npz data/rym_2017-04_bin_1000_val.pgn \
---out data/rym_2017-04_val.npz
-
-python -m scripts.build_rym_npz data/rym_2017-04_bin_1000_test.pgn \
---out data/rym_2017-04_test.npz
-"""

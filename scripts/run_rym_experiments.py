@@ -26,14 +26,18 @@ from .ply_features import NUM_PLANES  # type: ignore
 def auto_device() -> str:
     """
     Pick a default device.
-    We prefer CUDA (GPU) if available, then MPS on Apple Silicon, then CPU.
+    Prefer CUDA (GPU) if available, then MPS on Apple Silicon, then CPU.
+    Also print the chosen device for user visibility.
     """
     if torch.cuda.is_available():
-        return "cuda"
-    # Guard against torch.backends.mps not existing on non-Apple builds
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    print(f"[device] Auto-selected PyTorch device: {device}")
+    return device
 
 
 def ensure_npz_for_split(

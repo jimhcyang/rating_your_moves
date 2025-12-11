@@ -10,7 +10,7 @@ import pandas as pd
 from tqdm import tqdm
 
 # Reuse helpers from index_stats for loading indexes + rating bands
-from .index_stats import load_index_for_month, make_rating_bins  # type: ignore
+from .index_stats import load_index_for_month, make_rating_bins, K_TOL_DIFF
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # .../src
 DATA_DIR = ROOT_DIR / "data"
@@ -163,7 +163,7 @@ def prepare_rating_column(
     Prepare the rating column to be used for banding.
 
     - If rating_col == 'avg_elo', require both white_elo and black_elo, compute
-      avg_elo, and drop games with huge rating gaps (>|2*bin_size|).
+      avg_elo, and drop games with huge rating gaps (>|K_TOL_DIFF*bin_size|).
     - Else, just drop rows where rating_col is NaN.
     """
     df = df.copy()
@@ -187,12 +187,14 @@ def prepare_rating_column(
         rating_diff = (
             df["white_elo"].astype(float) - df["black_elo"].astype(float)
         ).abs()
-        max_diff = 2 * bin_size
+        max_diff = K_TOL_DIFF * bin_size
         mask_diff_ok = rating_diff <= max_diff
         dropped_diff = int((~mask_diff_ok).sum())
         if dropped_diff > 0:
             print(
-                f"[balance] Dropping {dropped_diff} games with |white_elo - black_elo| > {max_diff}."
+                f"[balance] Dropping {dropped_diff} games with "
+                f"|white_elo - black_elo| > {max_diff} "
+                f"(K_TOL_DIFF={K_TOL_DIFF} * bin_size)."
             )
         df = df[mask_diff_ok].copy()
 

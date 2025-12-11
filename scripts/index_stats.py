@@ -15,6 +15,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]  # .../src
 DATA_DIR = ROOT_DIR / "data"
 PLOTS_DIR = ROOT_DIR / "plots"
 
+# In avg_elo mode, we allow up to K_TOL_DIFF * bin_size rating difference
+# between white_elo and black_elo; larger mismatches are dropped.
+# With bin_size=200 and K_TOL_DIFF=1, we drop games with |white_elo - black_elo| > 200.
+K_TOL_DIFF = 1
+
 
 # ---------------------------------------------------------------------
 # Helpers: load index, parse time controls, rating bins
@@ -142,6 +147,10 @@ def make_rating_bins(
     """
     Add a 'rating_band' categorical column based on rating_col, using bins of
     width bin_size. Returns (df_with_band, band_labels in numeric order).
+
+    With the project defaults (bin_size=200, min_rating=400, max_rating=2400),
+    bands will be:
+        400-600, 600-800, ..., 2200-2400.
     """
     if rating_col not in df.columns:
         raise ValueError(f"Rating column '{rating_col}' not found in index.")
@@ -361,10 +370,10 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  # Basic stats for one month\n"
             "  python -m scripts.index_stats 2018-01\n\n"
-            "  # Filtered stats (only games with eval and clocks, white wins)\n"
+            "  # Filtered stats: 5+0 blitz with evals and clocks, white wins\n"
             "  python -m scripts.index_stats 2018-01 2018-02 \\\n"
-            "    --where 'result == \"1-0\" and has_clock and has_eval' \\\n"
-            "    --rating-col avg_elo --bin-size 100\n"
+            "    --where 'time_control == \"300+0\" and result == \"1-0\" and has_clock and has_eval' \\\n"
+            "    --rating-col avg_elo --bin-size 200 --min-rating 400 --max-rating 2400\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -378,7 +387,8 @@ def parse_args() -> argparse.Namespace:
         "-w",
         help=(
             "Pandas query over index columns, e.g. "
-            "'white_elo >= 1900 and result == \"1-0\" and has_eval'"
+            "'white_elo >= 1900 and result == \"1-0\" and has_eval' "
+            "For 5+0 blitz, use e.g. 'time_control == \"300+0\"'."
         ),
     )
     parser.add_argument(
@@ -388,27 +398,36 @@ def parse_args() -> argparse.Namespace:
             "Which rating column to use for rating bands. "
             "Typical options: 'white_elo', 'black_elo', or 'avg_elo'. "
             "Default: avg_elo (average of white_elo and black_elo). "
-            "In avg_elo mode, games with |white_elo - black_elo| > 2 * bin_size "
-            "are dropped."
+            "In avg_elo mode, games with |white_elo - black_elo| > K_TOL_DIFF * bin_size "
+            "are dropped (with current defaults K_TOL_DIFF=1, bin_size=200 → >200 Elo diff)."
         ),
     )
     parser.add_argument(
         "--bin-size",
         type=int,
-        default=100,
-        help="Rating band width (e.g. 100 → 0-100, 100-200, ...).",
+        default=200,
+        help=(
+            "Rating band width. With the project defaults (bin_size=200, "
+            "min_rating=400, max_rating=2400), bands are 400-600, 600-800, ..., 2200-2400."
+        ),
     )
     parser.add_argument(
         "--min-rating",
         type=int,
-        default=None,
-        help="Minimum rating for bands (default: inferred from data).",
+        default=400,
+        help=(
+            "Minimum rating for bands. Default: 400 (so with bin_size=200 and "
+            "max_rating=2400 you get 400-600 up to 2200-2400)."
+        ),
     )
     parser.add_argument(
         "--max-rating",
         type=int,
-        default=None,
-        help="Maximum rating for bands (default: inferred from data).",
+        default=2400,
+        help=(
+            "Maximum rating for bands. Default: 2400 (so with bin_size=200 and "
+            "min_rating=400 you get 400-600 up to 2200-2400)."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -487,7 +506,7 @@ def main() -> None:
         rating_diff = (
             df_rating["white_elo"].astype(float) - df_rating["black_elo"].astype(float)
         ).abs()
-        max_diff = 2 * args.bin_size
+        max_diff = K_TOL_DIFF * args.bin_size
         mask_diff_ok = rating_diff <= max_diff
         drop_rating_diff = int((~mask_diff_ok).sum())
         df_rating = df_rating[mask_diff_ok].copy()
@@ -529,7 +548,8 @@ def main() -> None:
     )
     if args.rating_col == "avg_elo":
         print(
-            f"  3) |white_elo - black_elo| > 2 * bin_size ({2 * args.bin_size}): {drop_rating_diff}"
+            f"  3) |white_elo - black_elo| > K_TOL_DIFF * bin_size "
+            f"({K_TOL_DIFF * args.bin_size}): {drop_rating_diff}"
         )
     else:
         print("  3) Rating-diff filter not applied (not in avg_elo mode).")
@@ -669,12 +689,18 @@ if __name__ == "__main__":
 
 
 """
+Example usage (with the new defaults)
 
-python -m scripts.index_stats 2017-04 2018-02 \
-  --where 'result == "1-0" and has_clock and has_eval' \
+# 1. Basic stats for 5+0 blitz in a single month
+python -m scripts.index_stats 2025-01 \
+  --where "time_control == '300+0'" \
   --rating-col avg_elo \
-  --bin-size 100
-  
-python -m scripts.index_stats 2017-04 --no-plots
+  --bin-size 200 \
+  --min-rating 400 \
+  --max-rating 2400
 
+# 2. Just print stats (no plots) for 5+0 blitz
+python -m scripts.index_stats 2025-01 \
+  --where "time_control == '300+0'" \
+  --no-plots
 """

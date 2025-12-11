@@ -11,8 +11,9 @@ At a high level, the workflow now covers:
 5. **A small model zoo** (linear → MLP → CNN → ResNet → conv-transformer) for predicting rating bands and Elo from a *single ply*.
 6. **End-to-end experiment runner** for training all model families across config grids.
 7. **Per-game inspection + visualization**, showing how models update their rating beliefs move by move, with Gaussian-smoothed rating distributions and animated plots over plies.
+8. **A preconfigured modern dataset pipeline** (`run_2025_pipeline.py`) that builds a Jan–Apr 2025 **5+0 blitz** dataset (balanced 400–2400 training splits + unbalanced “real-world” test set).
 
-The longer-term direction (still “research mode”) is a **sequence-level transformer** that consumes entire games as sequences of plies and maintains an explicit Bayesian posterior over playing strength across time. The current codebase already implements a “local encoder + Bayesian aggregation” version of that idea.
+We use **January 2025 (`2025-01`)** as the canonical example month throughout, and a combined **Jan–Apr 2025** 5+0 blitz dataset for the main experiments.
 
 ---
 
@@ -21,7 +22,7 @@ The longer-term direction (still “research mode”) is a **sequence-level tran
 The pipeline assumes access to the official Lichess monthly database:
 
 * Standard rated games in `.pgn.zst` format (e.g.
-  `lichess_db_standard_rated_2017-04.pgn.zst`).
+  `lichess_db_standard_rated_2025-01.pgn.zst`).
 
 Archives are typically downloaded from:
 
@@ -32,6 +33,8 @@ Each monthly file contains tens of millions of games. The code is designed to:
 * Decompress the `.pgn.zst` archive once,
 * Build an efficient row-wise index with offsets into the `.pgn`, and
 * Store game-level metadata in Parquet for fast filtering and aggregation.
+
+For current experiments, the script `run_2025_pipeline.py` targets **Jan–Apr 2025 5+0 blitz** games by default (details in §12.1).
 
 ---
 
@@ -48,15 +51,22 @@ Key Python dependencies (see `requirements.txt`):
 
   * `torch`, `transformers` (for the conv-transformer baseline and future sequence models)
 
-Set up a virtual environment, for example:
+### 2.2. Windows + CUDA setup (default)
+
+The repo assumes a typical **Windows + NVIDIA GPU (CUDA)** workflow for training:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # macOS/Linux
-# .venv\Scripts\activate   # Windows
+.venv\Scripts\activate
 
 pip install -r requirements.txt
-```
+````
+
+If you have a CUDA-capable GPU and drivers installed, PyTorch will typically expose it as `"cuda"`:
+
+* All training scripts accept `--device cuda` for GPU, or `--device cpu` if you want to force CPU.
+
+> Note: On macOS/Linux you can still use the code by adapting the virtualenv activation command (e.g., `source .venv/bin/activate`), but this README defaults to Windows/CUDA usage.
 
 The repository assumes a layout roughly like:
 
@@ -67,11 +77,13 @@ src/
     index_stats.py
     filter_games.py
     build_balanced_pgn.py
+    build_unbalanced_pgn.py
     ply_features.py
     build_rym_npz.py
     train_rym.py
     rym_models.py
     run_rym_experiments.py
+    run_2025_pipeline.py
     inspect_rym_game.py
 data/
   lichess_db_standard_rated_YYYY-MM.pgn.zst
@@ -79,10 +91,14 @@ data/
   lichess_db_standard_rated_YYYY-MM_index.parquet
   rym_YYYY-MM_*.pgn
   rym_YYYY-MM_*.npz
+  rym_2025_jan_apr_tc300+0_bin200_*.pgn
+  rym_2025_jan_apr_tc300+0_bin200_*.npz
+  rym_2025_jan_apr_tc300+0_unbalanced_realtest.* 
 models/
-  rym_YYYY-MM_baselines/*.pt
+  rym_2025-01_baselines/*.pt
+  rym_2025_jan_apr_baselines/*.pt
 plots/
-  YYYY-MM/...
+  2025-01/...
   rym_inspect/...
 ```
 
@@ -105,17 +121,17 @@ Paths are configurable via script arguments.
   * Parsed metadata: player ratings, increment/base time,
   * Boolean flags like `has_clock`, `has_eval` (engine annotations present).
 
-**Usage**
+**Usage (January 2025 example)**
 
 ```bash
-python -m scripts.build_month_index 2017-04
+python -m scripts.build_month_index 2025-01
 ```
 
 **Outputs**
 
-* `data/lichess_db_standard_rated_2017-04.pgn`
-* `data/lichess_db_standard_rated_2017-04_index.csv`
-* `data/lichess_db_standard_rated_2017-04_index.parquet`
+* `data/lichess_db_standard_rated_2025-01.pgn`
+* `data/lichess_db_standard_rated_2025-01_index.csv`
+* `data/lichess_db_standard_rated_2025-01_index.parquet`
 
 The Parquet index is the main input for downstream filtering and balancing.
 
@@ -140,21 +156,25 @@ The Parquet index is the main input for downstream filtering and balancing.
 Games are assigned to rating bands based on the **average Elo** of White and Black:
 
 * `avg_elo = (white_elo + black_elo) / 2`
-* Bands: `[600–700), [700–800), …` up to `[3000–3100)` (configurable).
-* Games with very lopsided pairings (e.g. `|white_elo - black_elo|` above a threshold) can be excluded so bands are not polluted by mismatched pairings.
+* For the 2025 pipeline, the default bands are:
+
+  * `[400–600), [600–800), …, [2200–2400)` (10 bands of width 200).
+* Bands and ranges are configurable via CLI arguments.
+
+Games with very lopsided pairings (e.g. `|white_elo - black_elo|` above a threshold) can be excluded so bands are not polluted by mismatched pairings.
 
 **Usage**
 
-Full month:
+Full month statistics for January 2025:
 
 ```bash
-python -m scripts.index_stats 2017-04
+python -m scripts.index_stats 2025-01
 ```
 
-Only games with engine evaluations:
+Only 5+0 blitz games:
 
 ```bash
-python -m scripts.index_stats 2017-04 --where 'has_eval'
+python -m scripts.index_stats 2025-01 --where 'time_control == "300+0"'
 ```
 
 **Outputs**
@@ -185,30 +205,30 @@ Drop summaries (e.g. missing ratings, unparsable time controls) are printed to m
 
 **Examples**
 
-Count only:
+Count only (January 2025, 5+0 blitz):
 
 ```bash
-python -m scripts.filter_games 2017-04 \
-  --where 'time_control == "300+0" and has_eval' \
+python -m scripts.filter_games 2025-01 \
+  --where 'time_control == "300+0"' \
   --count-only \
   --preview 5
 ```
 
-Export games to a new PGN:
+Export 5+0 games with clock information to a new PGN:
 
 ```bash
-python -m scripts.filter_games 2017-04 \
-  --where 'time_control == "300+0" and has_eval' \
-  --out-pgn data/filtered_2017-04_5+0_eval.pgn
+python -m scripts.filter_games 2025-01 \
+  --where 'time_control == "300+0" and has_clock' \
+  --out-pgn data/filtered_2025-01_5+0_clock.pgn
 ```
 
 The `--preview` mechanism shows a few sample games to visually sanity-check the filter.
 
 ---
 
-## 6. Balanced PGN Construction
+## 6. PGN Construction (Balanced & Unbalanced)
 
-### 6.1. Script: `build_balanced_pgn.py`
+### 6.1. Script: `build_balanced_pgn.py` (balanced dataset)
 
 **Purpose**
 
@@ -217,32 +237,98 @@ Construct a **balanced training dataset** across rating bands and other constrai
 **High-level behaviour**
 
 * Read monthly Parquet indexes and associated PGNs.
-* Compute the rating band (`avg_elo`) for each game using the same logic as `index_stats.py`.
-* For each band, sample up to `N` games (user-configurable).
-* Write a combined PGN containing games from all bands in balanced proportions.
+
+* Compute the rating column (`avg_elo`, or one player’s Elo) using consistent logic with `index_stats.py`:
+
+  * In `avg_elo` mode, games with large rating gaps (e.g. `|white_elo - black_elo| > K_TOL_DIFF × bin_size`) are dropped.
+
+* Bucket games into **rating bands** using `bin_size` and `[min_rating, max_rating)`:
+
+  * For the default 2025 setup: `min_rating = 400`, `max_rating = 2400`, `bin_size = 200` → 10 bands.
+
+* For each band, sample up to `per_band` games (user-configurable; default 100,000 in the 2025 workflow).
+
+* Concatenate sampled games across bands, shuffle, and split into **train/val/test**.
+
+* Write PGNs that are **approximately uniform across bands**.
 
 This balanced PGN is the primary input for move-level encoding and model training.
 
-**Usage (example)**
+**Usage (single-month example, January 2025 5+0 blitz)**
 
 ```bash
-python -m scripts.build_balanced_pgn 2017-04 \
-  --where 'has_eval and has_clock' \
+python -m scripts.build_balanced_pgn 2025-01 \
+  --where 'time_control == "300+0"' \
   --rating-col avg_elo \
-  --bin-size 100 \
-  --per-band 5000 \
+  --bin-size 200 \
+  --min-rating 400 \
+  --max-rating 2400 \
+  --per-band 100000 \
   --train-frac 0.8 \
   --val-frac 0.1 \
-  --out-prefix data/rym_2017-04_bin_1000
+  --test-frac 0.1 \
+  --out-prefix data/rym_2025-01_tc300+0_bin200
 ```
 
-This would create PGNs like:
+This creates PGNs like:
 
-* `data/rym_2017-04_bin_1000_train.pgn`
-* `data/rym_2017-04_bin_1000_val.pgn`
-* `data/rym_2017-04_bin_1000_test.pgn`
+* `data/rym_2025-01_tc300+0_bin200_train.pgn`
+* `data/rym_2025-01_tc300+0_bin200_val.pgn`
+* `data/rym_2025-01_tc300+0_bin200_test.pgn`
 
-each containing a balanced mix of rating bands.
+each containing a balanced mix of rating bands between 400 and 2400.
+
+---
+
+### 6.2. Script: `build_unbalanced_pgn.py` (real-world test set)
+
+**Purpose**
+
+Build an **unbalanced** PGN sample that reflects the *natural* rating distribution after filtering, to serve as a more realistic “in-the-wild” test set.
+
+**What it does**
+
+* Reuses the same core helpers as `build_balanced_pgn.py`:
+
+  * `load_indexes(months)` to concatenate monthly Parquet indexes.
+  * `prepare_rating_column(df, rating_col, bin_size)` to:
+
+    * Compute `avg_elo` where requested, and
+    * Apply the `K_TOL_DIFF × bin_size` rating-gap filter when `rating_col="avg_elo"`.
+
+* Applies a rating range filter `[min_rating, max_rating)` to the chosen rating column.
+
+* **Does not** perform rating-band binning or per-band balancing.
+
+* Draws a **uniform random sample** of `total-games` rows from the filtered pool.
+
+* Uses `write_pgn_for_index(df_sample, out_pgn)` to materialize the PGN by slicing from the original monthly `.pgn` files.
+
+This yields a PGN whose rating distribution mirrors the real data, under your filters.
+
+**Key arguments**
+
+* `months`: one or more `YYYY-MM` strings.
+* `--where`: pandas query over index columns (e.g. `time_control == "300+0"`).
+* `--rating-col`: `white_elo`, `black_elo`, or `avg_elo` (default: `avg_elo`).
+* `--bin-size`: used only to set the rating-gap tolerance in `avg_elo` mode.
+* `--min-rating`, `--max-rating`: rating range for inclusion.
+* `--total-games`: target number of games after all filters (if fewer are available, all are used).
+* `--out-prefix`: output prefix; the script writes `<prefix>.pgn`.
+
+**Example (Jan–Apr 2025 5+0 blitz, 400–2400)**
+
+```bash
+python -m scripts.build_unbalanced_pgn 2025-01 2025-02 2025-03 2025-04 \
+  --where "time_control == '300+0'" \
+  --rating-col avg_elo \
+  --bin-size 200 \
+  --min-rating 400 \
+  --max-rating 2400 \
+  --total-games 100000 \
+  --seed 64 \
+  --out-prefix data/rym_2025_jan_apr_tc300+0_unbalanced_realtest
+```
 
 ---
 
@@ -351,13 +437,13 @@ planes = encode_ply_planes(board, move, prev_move=None)  # (64, 8, 8) uint8
 
 **Purpose**
 
-Convert a balanced PGN (from `build_balanced_pgn.py`) into a compact `.npz` file suitable for PyTorch training.
+Convert a PGN (typically from `build_balanced_pgn.py`, but it can also be an unbalanced test PGN) into a compact `.npz` file suitable for PyTorch training.
 
 Each ply becomes a row in the dataset; each game becomes a sequence of rows linked by `game_id` + `ply_idx`.
 
 **What it does**
 
-* Reads a PGN of (typically balanced) games.
+* Reads a PGN of games.
 
 * For each game:
 
@@ -369,7 +455,7 @@ Each ply becomes a row in the dataset; each game becomes a sequence of rows link
 
   * Assigns a **rating band** index `y_bin ∈ {0, …, num_bins−1}` using `(min_rating, max_rating, num_bins)`.
 
-  * Iterates through all plies, encoding each ply as `X_t ∈ {0,1}^{64×8×8}` via `encode_ply_planes`.
+  * Iterates through all plies in the mainline, encoding each ply as `X_t ∈ {0,1}^{64×8×8}` via `encode_ply_planes`.
 
 * Stores the resulting arrays into a single `.npz` file.
 
@@ -378,25 +464,32 @@ Each ply becomes a row in the dataset; each game becomes a sequence of rows link
 The saved `.npz` contains:
 
 * `X`: `(N, NUM_PLANES, 8, 8)` `uint8` – ply feature tensors.
-* `y_bin`: `(N,)` `int64` – rating band index for that game.
+* `y_bin`: `(N,)` `int16` – rating band index for that game.
 * `y_elo`: `(N,)` `float32` – numeric rating (average Elo) used for banding.
-* `game_id`: `(N,)` `int64` – integer game index.
-* `ply_idx`: `(N,)` `int64` – ply index within the game.
-* `num_bins`: scalar.
-* `min_rating`: scalar.
-* `max_rating`: scalar.
+* `game_id`: `(N,)` `int32` – integer game index (0-based within this PGN).
+* `ply_idx`: `(N,)` `int16` – ply index within the game.
+* `num_bins`: scalar `int16`.
+* `min_rating`: scalar `int16`.
+* `max_rating`: scalar `int16`.
 
 Every ply of a game shares the same `y_bin` and `y_elo`.
 
-**Usage**
+**Usage (January 2025, balanced PGNs)**
 
 ```bash
 python -m scripts.build_rym_npz \
-  --pgn-path data/rym_2017-04_bin_1000_train.pgn \
-  --out-path data/rym_2017-04_train.npz \
-  --min-rating 800 \
-  --max-rating 2300 \
-  --num-bins 15
+  data/rym_2025-01_tc300+0_bin200_train.pgn \
+  --out data/rym_2025-01_tc300+0_bin200_train.npz \
+  --min-rating 400 \
+  --max-rating 2400 \
+  --num-bins 10
+
+python -m scripts.build_rym_npz \
+  data/rym_2025-01_tc300+0_bin200_val.pgn \
+  --out data/rym_2025-01_tc300+0_bin200_val.npz \
+  --min-rating 400 \
+  --max-rating 2400 \
+  --num-bins 10
 ```
 
 You typically run this for `train`, `val`, and `test` PGNs.
@@ -435,20 +528,24 @@ Available families:
 
   * Single linear layer on flattened input.
   * Very simple baseline.
+
 * `"mlp"`
 
   * Flatten + 1–2 hidden layers with nonlinearity.
   * Tunable hidden size / depth via `config_id`.
+
 * `"cnn"`
 
   * Small convolutional network over the 8×8 board:
 
     * Conv → Conv → pooling → MLP.
+
 * `"resnet"`
 
   * Residual CNN with skip connections:
 
     * Suitable for deeper spatial feature extraction.
+
 * `"conv_transformer"`
 
   * Hybrid:
@@ -489,7 +586,10 @@ Train a **single** model configuration on a pair of NPZ files (`train` + `val`),
 `train_rym.py` defines `RYMNpzDataset`, a thin wrapper around the `.npz` file:
 
 ```python
-ds = RYMNpzDataset(Path("data/rym_2017-04_train.npz"))
+from pathlib import Path
+from scripts.train_rym import RYMNpzDataset
+
+ds = RYMNpzDataset(Path("data/rym_2025-01_tc300+0_bin200_train.npz"))
 sample = ds[0]
 # sample["X"]: (NUM_PLANES, 8, 8) float32
 # sample["y_bin"]: long
@@ -515,8 +615,6 @@ The dataset also exposes:
      * A band-distance matrix `D[i,j] = |i − j|` is constructed.
      * Misclassifications that are far from the true band are penalized more heavily than near-misses.
 
-   Intuition: predicting a 2000 player as 1900 is “less wrong” than predicting them as 900, and the loss reflects that.
-
 2. **Regression loss (Elo)**
 
    * MSE between `rating_pred` and `y_elo` (the actual average Elo).
@@ -538,23 +636,23 @@ The dataset also exposes:
   * `acc` (top-1 accuracy on band index)
   * `mae_rating` (mean absolute error in Elo)
 
-**CLI usage**
+**CLI usage (2025-01 example)**
 
 ```bash
-python -m scripts.train_rym \
-  --train-npz data/rym_2017-04_train.npz \
-  --val-npz   data/rym_2017-04_val.npz   \
-  --model-type resnet \
-  --config-id 0 \
-  --batch-size 256 \
-  --epochs 10 \
-  --lr 1e-3 \
-  --alpha-reg 1.0 \
-  --device cuda \
-  --save-path models/rym_2017-04_baselines/rym_resnet_cfg0.pt
+python -m scripts.train_rym ^
+  --train-npz data/rym_2025-01_tc300+0_bin200_train.npz ^
+  --val-npz   data/rym_2025-01_tc300+0_bin200_val.npz   ^
+  --model-type resnet ^
+  --config-id 0 ^
+  --batch-size 256 ^
+  --epochs 10 ^
+  --lr 1e-3 ^
+  --alpha-reg 1.0 ^
+  --device cuda ^
+  --save-path models/rym_2025-01_baselines/rym_resnet_cfg0.pt
 ```
 
-This is useful if you want tight manual control over a single run.
+(This uses Windows `^` line continuations; you can also write the command on one line.)
 
 ---
 
@@ -582,13 +680,14 @@ The helper `ensure_npz_for_split(...)` will:
   * `"{pgn_prefix}_train.pgn"`
   * `"{pgn_prefix}_val.pgn"`
   * `"{pgn_prefix}_test.pgn"` (optional)
+
 * Create NPZs at:
 
   * `"{npz_prefix}_train.npz"`
   * `"{npz_prefix}_val.npz"`
   * `"{npz_prefix}_test.npz"`
 
-by calling `pgn_to_npz(...)` under the hood if needed.
+by calling `build_rym_npz.main()` under the hood if needed.
 
 **Step 2 – DataLoaders**
 
@@ -643,27 +742,26 @@ Each checkpoint stores:
 * `num_planes` (for sanity)
 * `num_bins`
 
-**Usage example**
+**Usage example (2025-01, 400–2400, 200pt bands)**
 
 ```bash
-python -m scripts.run_rym_experiments \
-  --pgn-prefix data/rym_2017-04_bin_1000 \
-  --npz-prefix data/rym_2017-04 \
-  --min-rating 800 \
-  --max-rating 2300 \
-  --num-bins 15 \
-  --force-rebuild-npz \
-  --models all \
-  --config-id all \
-  --batch-size 256 \
-  --epochs 5 \
-  --lr 1e-3 \
-  --alpha-reg 1.0 \
-  --device cuda \
-  --save-dir models/rym_2017-04_baselines
+python -m scripts.run_rym_experiments ^
+  --pgn-prefix data/rym_2025-01_tc300+0_bin200 ^
+  --npz-prefix data/rym_2025-01_tc300+0_bin200 ^
+  --min-rating 400 ^
+  --max-rating 2400 ^
+  --num-bins 10 ^
+  --models all ^
+  --config-id all ^
+  --batch-size 256 ^
+  --epochs 5 ^
+  --lr 1e-3 ^
+  --alpha-reg 1.0 ^
+  --device cuda ^
+  --save-dir models/rym_2025-01_baselines
 ```
 
-This will train **all model families** with **all configs** on the April 2017 dataset, saving a grid of checkpoints you can later use for analysis or inspection.
+This trains **all model families** with **all configs** on the January 2025 balanced 5+0 dataset, saving a grid of checkpoints you can later use for analysis or inspection.
 
 ---
 
@@ -706,7 +804,7 @@ For a given game:
 * At each ply `t`, you compute a likelihood:
 
   ```python
-  lik_t = softmax(logits_seq[t])
+  lik_t = torch.softmax(logits_seq[t], dim=-1)
   ```
 
 * You maintain a posterior `p_t`:
@@ -802,14 +900,14 @@ which will display all PNGs in order as a simple in-notebook animation.
 
 One nice feature: `inspect_rym_game.py` can work with **your own PGN** even if you don’t have an NPZ yet.
 
-**CLI**
+**CLI (using 2025-01 baselines)**
 
 ```bash
-python -m scripts.inspect_rym_game \
-  --test-pgn my_games_rapid.pgn \
-  --models-dir models/rym_2017-04_baselines \
-  --config-id 0 \
-  --device cuda \
+python -m scripts.inspect_rym_game ^
+  --test-pgn my_games_rapid.pgn ^
+  --models-dir models/rym_2025-01_baselines ^
+  --config-id 0 ^
+  --device cuda ^
   --out-dir plots/rym_my_games
 ```
 
@@ -837,47 +935,55 @@ Behaviour:
 
 ---
 
-## 12. End-to-End Example
+## 12. End-to-End Example (Single Month: January 2025)
 
-Putting everything together, a typical workflow looks like:
+Putting everything together for **January 2025 5+0 blitz**, a typical manual workflow looks like:
 
-1. **Index a month of Lichess games**
+1. **Index January 2025 Lichess games**
 
    ```bash
-   python -m scripts.build_month_index 2017-04
+   python -m scripts.build_month_index 2025-01
    ```
 
 2. **Explore rating/time-control structure**
 
    ```bash
-   python -m scripts.index_stats 2017-04 --where 'has_eval and has_clock'
+   python -m scripts.index_stats 2025-01 --where 'time_control == "300+0"'
    ```
 
-3. **Filter and build a balanced PGN**
+3. **Filter and build a balanced PGN (5+0, 400–2400, 200pt bands)**
 
    ```bash
-   python -m scripts.build_balanced_pgn 2017-04 \
-     --where 'has_eval and has_clock' \
-     --rating-col avg_elo \
-     --bin-size 100 \
-     --per-band 5000 \
-     --train-frac 0.8 \
-     --val-frac 0.1 \
-     --out-prefix data/rym_2017-04_bin_1000
+   python -m scripts.build_balanced_pgn 2025-01 ^
+     --where 'time_control == "300+0"' ^
+     --rating-col avg_elo ^
+     --bin-size 200 ^
+     --min-rating 400 ^
+     --max-rating 2400 ^
+     --per-band 100000 ^
+     --train-frac 0.8 ^
+     --val-frac 0.1 ^
+     --test-frac 0.1 ^
+     --out-prefix data/rym_2025-01_tc300+0_bin200
    ```
 
-4. **(Optional) Manually build NPZs**
+4. **Build NPZs for train/val/test**
 
    ```bash
-   python -m scripts.build_rym_npz \
-     --pgn-path data/rym_2017-04_bin_1000_train.pgn \
-     --out-path data/rym_2017-04_train.npz \
-     --min-rating 800 --max-rating 2300 --num-bins 15
+   python -m scripts.build_rym_npz ^
+     data/rym_2025-01_tc300+0_bin200_train.pgn ^
+     --out data/rym_2025-01_tc300+0_bin200_train.npz ^
+     --min-rating 400 --max-rating 2400 --num-bins 10
 
-   python -m scripts.build_rym_npz \
-     --pgn-path data/rym_2017-04_bin_1000_val.pgn \
-     --out-path data/rym_2017-04_val.npz \
-     --min-rating 800 --max-rating 2300 --num-bins 15
+   python -m scripts.build_rym_npz ^
+     data/rym_2025-01_tc300+0_bin200_val.pgn ^
+     --out data/rym_2025-01_tc300+0_bin200_val.npz ^
+     --min-rating 400 --max-rating 2400 --num-bins 10
+
+   python -m scripts.build_rym_npz ^
+     data/rym_2025-01_tc300+0_bin200_test.pgn ^
+     --out data/rym_2025-01_tc300+0_bin200_test.npz ^
+     --min-rating 400 --max-rating 2400 --num-bins 10
    ```
 
    (Or just let `run_rym_experiments.py` do this automatically.)
@@ -885,49 +991,122 @@ Putting everything together, a typical workflow looks like:
 5. **Train a grid of baselines**
 
    ```bash
-   python -m scripts.run_rym_experiments \
-     --pgn-prefix data/rym_2017-04_bin_1000 \
-     --npz-prefix data/rym_2017-04 \
-     --min-rating 800 --max-rating 2300 --num-bins 15 \
-     --models all \
-     --config-id all \
-     --batch-size 256 \
-     --epochs 5 \
-     --lr 1e-3 \
-     --alpha-reg 1.0 \
-     --device cuda \
-     --save-dir models/rym_2017-04_baselines
+   python -m scripts.run_rym_experiments ^
+     --pgn-prefix data/rym_2025-01_tc300+0_bin200 ^
+     --npz-prefix data/rym_2025-01_tc300+0_bin200 ^
+     --min-rating 400 --max-rating 2400 --num-bins 10 ^
+     --models all ^
+     --config-id all ^
+     --batch-size 256 ^
+     --epochs 5 ^
+     --lr 1e-3 ^
+     --alpha-reg 1.0 ^
+     --device cuda ^
+     --save-dir models/rym_2025-01_baselines
    ```
 
 6. **Inspect a single game from the test split**
 
    ```bash
-   python -m scripts.inspect_rym_game \
-     --test-npz data/rym_2017-04_test.npz \
-     --test-pgn data/rym_2017-04_bin_1000_test.pgn \
-     --models-dir models/rym_2017-04_baselines \
-     --config-id 0 \
-     --device cuda \
+   python -m scripts.inspect_rym_game ^
+     --test-npz data/rym_2025-01_tc300+0_bin200_test.npz ^
+     --test-pgn data/rym_2025-01_tc300+0_bin200_test.pgn ^
+     --models-dir models/rym_2025-01_baselines ^
+     --config-id 0 ^
+     --device cuda ^
      --out-dir plots/rym_inspect
    ```
 
 7. **Inspect one of your own games**
 
    ```bash
-   python -m scripts.inspect_rym_game \
-     --test-pgn my_own_games.pgn \
-     --models-dir models/rym_2017-04_baselines \
-     --config-id 0 \
-     --device cuda \
+   python -m scripts.inspect_rym_game ^
+     --test-pgn my_own_games.pgn ^
+     --models-dir models/rym_2025-01_baselines ^
+     --config-id 0 ^
+     --device cuda ^
      --out-dir plots/rym_my_games
    ```
 
-   Then in a notebook:
+   Then in a Jupyter notebook:
 
    ```python
    from scripts.inspect_rym_game import replay_images
    replay_images("plots/rym_my_games", delay=0.05)
    ```
+
+---
+
+### 12.1. Jan–Apr 2025 5+0 Blitz Pipeline (`run_2025_pipeline.py`)
+
+For the main RYM experiments in this repo, we provide a **single end-to-end script** that builds a modern dataset from the Lichess 2025 dumps.
+
+By default, it:
+
+* Uses months **2025-01, 2025-02, 2025-03, 2025-04** (`--months` overrideable).
+
+* Filters to **5+0 blitz** via `time_control == "300+0"` (`--time-control`).
+
+* Restricts ratings to **[400, 2400)** with **200-point bands**:
+
+  * `min-rating = 400`, `max-rating = 2400`, `bin-size = 200`.
+  * This yields `num_bins = 10` bands: 400–600, 600–800, …, 2200–2400.
+
+* Targets **100k games per band** for the **balanced** dataset (`--per-band 100000`).
+
+* Builds a separate **unbalanced “real-world” test set** with up to **100k games**
+  (`--unbalanced-total 100000`).
+
+Conceptually:
+
+* The **balanced dataset** is for training / validation:
+
+  * Roughly uniform over rating bands from 400 to 2400.
+  * Split into train / val / test via `train-frac`, `val-frac`, `test-frac`.
+
+* The **unbalanced dataset** is for evaluation:
+
+  * Keeps the same filters (time control + rating range),
+  * but **preserves the natural rating distribution** instead of enforcing bands.
+
+**Files produced (by default)**
+
+Under `data/`:
+
+* Balanced PGNs:
+
+  * `rym_2025_jan_apr_tc300+0_bin200_train.pgn`
+  * `rym_2025_jan_apr_tc300+0_bin200_val.pgn`
+  * `rym_2025_jan_apr_tc300+0_bin200_test.pgn`
+
+* Balanced NPZs:
+
+  * `rym_2025_jan_apr_tc300+0_bin200_train.npz`
+  * `rym_2025_jan_apr_tc300+0_bin200_val.npz`
+  * `rym_2025_jan_apr_tc300+0_bin200_test.npz`
+
+* Unbalanced real-world test:
+
+  * `rym_2025_jan_apr_tc300+0_unbalanced_realtest.pgn`
+  * `rym_2025_jan_apr_tc300+0_unbalanced_realtest.npz`
+
+**Running the pipeline (Windows)**
+
+```bash
+python -m scripts.run_2025_pipeline
+```
+
+This will:
+
+1. Ensure the monthly `.pgn.zst` dumps and indexes exist (download/decompress if needed).
+2. Build the **balanced** PGNs across Jan–Apr 2025 (if they do not already exist).
+3. Convert them to NPZs via `build_rym_npz` (if NPZs do not already exist).
+4. Build the **unbalanced** PGN via `build_unbalanced_pgn` (if not present).
+5. Convert the unbalanced PGN to an NPZ.
+6. Optionally clean up the raw monthly `.pgn` / `.pgn.zst` files if
+   `--cleanup-pgn` / `--cleanup-zst` are set.
+
+This gives you a **modern, large-scale 5+0 blitz dataset** ready for training and evaluation with the rest of the RYM pipeline.
 
 ---
 
@@ -938,6 +1117,7 @@ The current codebase gives you:
 * A scalable preprocessing pipeline from raw Lichess archives to balanced, move-level datasets.
 * A family of local board encoders with a principled Bayesian aggregation over plies.
 * Tools to visualize how rating beliefs evolve move by move, across multiple model families.
+* A concrete modern experimental setup (Jan–Apr 2025 5+0 blitz, 400–2400, 200pt bands) for reproducible studies on a **Windows + CUDA** stack.
 
 Future extensions (some hinted at already in the code) include:
 
@@ -945,14 +1125,17 @@ Future extensions (some hinted at already in the code) include:
 
   * Consume sequences of plies `(X_0, …, X_{T-1})` directly.
   * Maintain an internal belief state over rating that’s learned end-to-end.
+
 * **Richer metadata inputs**:
 
   * Clock times, engine evals, time usage patterns, opening families.
+
 * **Multi-task setups**:
 
   * Predict rating, time control, or even “style” clusters concurrently.
+
 * **Cross-month generalization**:
 
   * Train on several months, evaluate out-of-distribution on others.
 
-For now, the repository already lets you answer a surprisingly rich set of questions about **how much information each move carries about a player’s strength**, and how different architectures “see” the same game.
+For now, the repository already lets you answer a rich set of questions about **how much information each move carries about a player’s strength**, and how different architectures “see” the same game, all within a reproducible 2025-era Lichess blitz setting.
