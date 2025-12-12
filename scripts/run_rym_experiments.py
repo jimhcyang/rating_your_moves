@@ -3,170 +3,208 @@ from __future__ import annotations
 
 import argparse
 import logging
+import gc
 from pathlib import Path
-from typing import List, Sequence, Dict, Any, Tuple
+from typing import List, Sequence, Dict, Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
-from .build_rym_npz import pgn_to_npz  # type: ignore
-from .train_rym import RYMNpzDataset  # type: ignore
+from .train_rym import RYMNpzDataset, train_one_epoch, evaluate  # type: ignore
 from .rym_models import get_model, MODEL_TYPES  # type: ignore
 from .ply_features import NUM_PLANES  # type: ignore
 
 
+log = logging.getLogger("run_rym_experiments")
+
+
 # ---------------------------------------------------------------------
-# Helpers
+# Shard discovery helpers
 # ---------------------------------------------------------------------
 
 
-def auto_device() -> str:
+def _parse_shard_indices(spec: str) -> List[int]:
     """
-    Pick a default device.
-    Prefer CUDA (GPU) if available, then MPS on Apple Silicon, then CPU.
-    Also print the chosen device for user visibility.
+    Helper for parsing shard ranges.
+
+    Examples:
+      "all"     -> special value handled elsewhere
+      "0"       -> [0]
+      "0,1,5"   -> [0, 1, 5]
     """
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        device = "mps"
+    spec = spec.strip()
+    if spec.lower() == "all":
+        raise ValueError("Internal: 'all' should be handled by discover_shards.")
+    if not spec:
+        return []
+    out: List[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise ValueError(f"Invalid shard index '{part}' in spec '{spec}'.")
+    return sorted(set(out))
+
+
+def discover_shards(prefix: str, shard_spec: str) -> List[Path]:
+    """
+    Given a prefix like:
+        data/rym_2025_jan_apr_tc300+0_bin200_train_shard
+
+    and a shard_spec of either:
+        "all"          → discover shard000, shard001, ... until missing
+        "0" or "0,1"   → return exactly those
+
+    return a sorted list of NPZ shard paths.
+    """
+    base = Path(prefix)
+    paths: List[Path] = []
+
+    if shard_spec.lower() == "all":
+        idx = 0
+        while True:
+            p = base.with_name(f"{base.name}{idx:03d}.npz")
+            if not p.exists():
+                break
+            paths.append(p)
+            idx += 1
     else:
-        device = "cpu"
+        indices = _parse_shard_indices(shard_spec)
+        for idx in indices:
+            p = base.with_name(f"{base.name}{idx:03d}.npz")
+            if not p.exists():
+                raise FileNotFoundError(f"Requested shard does not exist: {p}")
+            paths.append(p)
 
-    print(f"[device] Auto-selected PyTorch device: {device}")
-    return device
+    if not paths:
+        log.warning("No shards found for prefix=%s spec=%s", prefix, shard_spec)
+    else:
+        log.info("Discovered %d shards for prefix=%s spec=%s", len(paths), prefix, shard_spec)
+    return sorted(paths)
 
 
-def ensure_npz_for_split(
-    split: str,
-    pgn_prefix: Path,
-    npz_prefix: Path,
-    min_rating: int,
-    max_rating: int,
-    num_bins: int,
-    force_rebuild: bool = False,
-) -> Path:
+# ---------------------------------------------------------------------
+# Meta-data extraction
+# ---------------------------------------------------------------------
+
+
+def infer_rating_metadata(shard_paths: Sequence[Path]) -> Dict[str, Any]:
     """
-    For a split in {train,val,test}, ensure we have an NPZ file.
-
-    PGN is assumed at:  pgn_prefix + f"_{split}.pgn"
-    NPZ will be at:     npz_prefix + f"_{split}.npz"
+    Load the first available shard and read num_bins / rating range.
+    Ensures all shards share the same metadata.
     """
-    log = logging.getLogger("run_rym_experiments")
-    pgn_path = Path(f"{pgn_prefix}_{split}.pgn")
-    npz_path = Path(f"{npz_prefix}_{split}.npz")
+    if not shard_paths:
+        raise ValueError("infer_rating_metadata called with empty shard_paths.")
 
-    if not pgn_path.exists():
-        raise FileNotFoundError(f"PGN for split '{split}' not found: {pgn_path}")
+    first_ds = RYMNpzDataset(shard_paths[0])
+    num_bins = first_ds.num_bins
+    min_rating = first_ds.min_rating
+    max_rating = first_ds.max_rating
 
-    if npz_path.exists() and not force_rebuild:
-        log.info("Found existing NPZ for %s: %s (skipping build)", split, npz_path)
-        return npz_path
-
-    log.info("Building NPZ for %s from %s → %s", split, pgn_path, npz_path)
-    pgn_to_npz(
-        pgn_path=pgn_path,
-        out_path=npz_path,
-        max_games=None,
-        min_rating=min_rating,
-        max_rating=max_rating,
-        num_bins=num_bins,
-    )
-    return npz_path
-
-
-def build_loaders(
-    train_npz: Path,
-    val_npz: Path,
-    batch_size: int,
-    num_workers: int,
-) -> tuple[DataLoader, DataLoader, int]:
-    """
-    Build DataLoaders for train/val splits and return num_bins.
-    """
-    train_ds = RYMNpzDataset(train_npz)
-    val_ds = RYMNpzDataset(val_npz)
-
-    num_bins = train_ds.num_bins
-    if num_bins != val_ds.num_bins:
-        raise ValueError(
-            f"Train/val num_bins mismatch: {num_bins} vs {val_ds.num_bins}"
-        )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    return train_loader, val_loader, num_bins
-
-
-def train_one_epoch_tqdm(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    alpha_reg: float,
-) -> Dict[str, float]:
-    """
-    Training loop with tqdm over batches.
-    """
-    model.train()
-    total_loss = 0.0
-    total_cls = 0.0
-    total_reg = 0.0
-    n_samples = 0
-
-    for batch in tqdm(loader, desc="  train", leave=False):
-        X = batch["X"].to(device)
-        y_bin = batch["y_bin"].to(device)
-        y_elo = batch["y_elo"].to(device)
-
-        logits, rating_pred = model(X)
-        loss_cls = F.cross_entropy(logits, y_bin)
-        loss_reg = F.mse_loss(rating_pred, y_elo)
-        loss = loss_cls + alpha_reg * loss_reg
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        B = X.size(0)
-        total_loss += float(loss.item()) * B
-        total_cls += float(loss_cls.item()) * B
-        total_reg += float(loss_reg.item()) * B
-        n_samples += B
+    for p in shard_paths[1:]:
+        ds = RYMNpzDataset(p)
+        if ds.num_bins != num_bins:
+            raise ValueError(f"num_bins mismatch across shards: {num_bins} vs {ds.num_bins} (in {p})")
+        if ds.min_rating != min_rating or ds.max_rating != max_rating:
+            raise ValueError(
+                "Rating range mismatch across shards: "
+                f"({min_rating},{max_rating}) vs ({ds.min_rating},{ds.max_rating}) (in {p})"
+            )
 
     return {
-        "loss": total_loss / n_samples,
-        "loss_cls": total_cls / n_samples,
-        "loss_reg": total_reg / n_samples,
+        "num_bins": num_bins,
+        "min_rating": min_rating,
+        "max_rating": max_rating,
     }
 
 
-@torch.no_grad()
-def evaluate_tqdm(
+# ---------------------------------------------------------------------
+# Training / evaluation over shards
+# ---------------------------------------------------------------------
+
+
+def train_over_shards(
     model: torch.nn.Module,
-    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    shard_paths: Sequence[Path],
     device: torch.device,
+    *,
+    batch_size: int,
+    num_workers: int,
+    min_rating: float,
+    max_rating: float,
     alpha_reg: float,
+    lambda_ent: float,
 ) -> Dict[str, float]:
     """
-    Evaluation loop with tqdm over batches.
+    Run one logical "epoch" over all train shards.
     """
-    model.eval()
+    total_loss = 0.0
+    total_cls = 0.0
+    total_reg = 0.0
+    total_samples = 0
+
+    for shard_path in shard_paths:
+        log.info("  [train] shard %s", shard_path.name)
+        ds = RYMNpzDataset(shard_path)
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+        metrics = train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            device=device,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            alpha_reg=alpha_reg,
+            lambda_ent=lambda_ent,
+        )
+
+        n = len(ds)
+        total_loss += metrics["loss"] * n
+        total_cls += metrics["loss_cls"] * n
+        total_reg += metrics["loss_reg"] * n
+        total_samples += n
+
+        del ds, loader
+        gc.collect()
+
+    if total_samples == 0:
+        raise RuntimeError("No train samples found across shards.")
+
+    return {
+        "loss": total_loss / total_samples,
+        "loss_cls": total_cls / total_samples,
+        "loss_reg": total_reg / total_samples,
+    }
+
+
+def evaluate_over_shards(
+    model: torch.nn.Module,
+    shard_paths: Sequence[Path],
+    device: torch.device,
+    *,
+    batch_size: int,
+    num_workers: int,
+    min_rating: float,
+    max_rating: float,
+    alpha_reg: float,
+    lambda_ent: float,
+) -> Dict[str, float]:
+    """
+    Evaluate a model over one or more shards, aggregating metrics
+    weighted by number of samples.
+    """
     total_loss = 0.0
     total_cls = 0.0
     total_reg = 0.0
@@ -174,26 +212,40 @@ def evaluate_tqdm(
     total_samples = 0
     total_abs_err = 0.0
 
-    for batch in tqdm(loader, desc="  val", leave=False):
-        X = batch["X"].to(device)
-        y_bin = batch["y_bin"].to(device)
-        y_elo = batch["y_elo"].to(device)
+    for shard_path in shard_paths:
+        log.info("  [eval] shard %s", shard_path.name)
+        ds = RYMNpzDataset(shard_path)
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
 
-        logits, rating_pred = model(X)
-        loss_cls = F.cross_entropy(logits, y_bin)
-        loss_reg = F.mse_loss(rating_pred, y_elo)
-        loss = loss_cls + alpha_reg * loss_reg
+        metrics = evaluate(
+            model,
+            loader,
+            device=device,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            alpha_reg=alpha_reg,
+            lambda_ent=lambda_ent,
+        )
 
-        B = X.size(0)
-        total_loss += float(loss.item()) * B
-        total_cls += float(loss_cls.item()) * B
-        total_reg += float(loss_reg.item()) * B
+        n = len(ds)
+        total_loss += metrics["loss"] * n
+        total_cls += metrics["loss_cls"] * n
+        total_reg += metrics["loss_reg"] * n
+        total_correct += metrics["acc"] * n
+        total_abs_err += metrics["mae_rating"] * n
+        total_samples += n
 
-        preds_bin = logits.argmax(dim=1)
-        total_correct += int((preds_bin == y_bin).sum().item())
-        total_samples += B
+        del ds, loader
+        gc.collect()
 
-        total_abs_err += float(torch.abs(rating_pred - y_elo).sum().item())
+    if total_samples == 0:
+        raise RuntimeError("No evaluation samples found across shards.")
 
     return {
         "loss": total_loss / total_samples,
@@ -204,289 +256,303 @@ def evaluate_tqdm(
     }
 
 
-def parse_model_list(s: str) -> List[str]:
-    s = s.strip()
-    if s.lower() == "all":
-        return list(MODEL_TYPES)
-    names = [x.strip() for x in s.split(",") if x.strip()]
-    for name in names:
-        if name not in MODEL_TYPES:
-            raise ValueError(f"Unknown model type '{name}', valid: {MODEL_TYPES}")
-    return names
-
-
-def parse_config_ids(spec: str) -> List[int]:
-    """Parse config-id spec into a sorted list of unique ints.
-
-    Examples:
-      '0'       -> [0]
-      '0,2,3'   -> [0, 2, 3]
-      'all'     -> [0, 1, 2, 3]
-    """
-    spec = spec.strip()
-    if not spec:
-        return [0]
-    if spec.lower() == "all":
-        return [0, 1, 2, 3]
-
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    cfgs: list[int] = []
-    for p in parts:
-        try:
-            v = int(p)
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid config-id '{p}', expected integers 0..3 or 'all'"
-            ) from exc
-        if v < 0 or v > 3:
-            raise ValueError(f"config-id out of range: {v}, expected 0..3")
-        cfgs.append(v)
-
-    return sorted(set(cfgs))
-
-
 # ---------------------------------------------------------------------
-# CLI
+# CLI + main training loop
 # ---------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "End-to-end RYM runner: ensure NPZs exist, then train "
-            "config(s) for one or more model families.\n\n"
-            "Example:\n"
-            "  python -m scripts.run_rym_experiments \\\n"
-            "    --pgn-prefix data/rym_2017-04_bin_1000 \\\n"
-            "    --npz-prefix data/rym_2017-04 \\\n"
-            "    --min-rating 800 --max-rating 2300 --num-bins 15 \\\n"
-            "    --models all --config-id all --epochs 5 --batch-size 256\n"
+            "Sharded RYM experiment runner.\n\n"
+            "Assumes you have already built NPZ shards named like:\n"
+            "  rym_2025_jan_apr_tc300+0_bin200_train_shard000.npz\n"
+            "  rym_2025_jan_apr_tc300+0_bin200_val_shard000.npz\n"
+            "  rym_2025_jan_apr_tc300+0_bin200_test_shard000.npz\n"
+            "  rym_2025_jan_apr_tc300+0_unbalanced_realtest_shard000.npz\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    # Model config
     parser.add_argument(
-        "--pgn-prefix",
+        "--model-type",
         type=str,
-        required=True,
-        help="Prefix for balanced PGNs, e.g. data/rym_2017-04_bin_1000",
-    )
-    parser.add_argument(
-        "--npz-prefix",
-        type=str,
-        required=True,
-        help="Prefix for NPZ files, e.g. data/rym_2017-04",
-    )
-    parser.add_argument(
-        "--min-rating",
-        type=int,
-        default=800,
-        help="Minimum rating edge for bands (inclusive).",
-    )
-    parser.add_argument(
-        "--max-rating",
-        type=int,
-        default=2300,
-        help="Maximum rating edge for bands (exclusive).",
-    )
-    parser.add_argument(
-        "--num-bins",
-        type=int,
-        default=15,
-        help="Number of rating bands between min-rating and max-rating.",
-    )
-    parser.add_argument(
-        "--force-rebuild-npz",
-        action="store_true",
-        help="Force rebuilding NPZ even if it already exists.",
-    )
-    parser.add_argument(
-        "--models",
-        type=str,
-        default="all",
-        help="Comma-separated list of model families, or 'all'. "
-             f"Options: {MODEL_TYPES}",
+        choices=MODEL_TYPES,
+        default="resnet",
+        help="Model family (linear, mlp, cnn, resnet, conv_transformer).",
     )
     parser.add_argument(
         "--config-id",
-        type=str,
-        default="0",
-        help="Config index spec: '0', '0,2,3', or 'all' for [0,1,2,3].",
+        type=int,
+        default=0,
+        help="Small discrete config index (0..3) within that family.",
     )
+
+    # Optimisation
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--alpha-reg",
         type=float,
-        default=1.0,
-        help="Weight for regression loss vs classification loss.",
+        default=0.0,
+        help="Weight for regression loss vs classification loss (0.0 disables regression).",
+    )
+    parser.add_argument(
+        "--lambda-ent",
+        type=float,
+        default=0.0,
+        help="Entropy bonus weight in the classification loss (0.0 disables entropy term).",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default=auto_device(),
-        help="Device to use: 'cuda', 'mps', or 'cpu'. Defaults to a sensible choice.",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device string for torch.device, e.g. 'cuda', 'mps', or 'cpu'.",
     )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+
+    # Shard prefixes + specs
     parser.add_argument(
-        "--save-dir",
+        "--train-prefix",
         type=str,
-        default=None,
-        help="Optional directory to save model checkpoints.",
+        default=str(Path("data") / "rym_2025_jan_apr_tc300+0_bin200_train_shard"),
+        help=(
+            "Prefix for BALANCED train shards. "
+            "Shards are expected as '<prefix><NNN>.npz'."
+        ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--val-prefix",
+        type=str,
+        default=str(Path("data") / "rym_2025_jan_apr_tc300+0_bin200_val_shard"),
+        help="Prefix for BALANCED val shards.",
+    )
+    parser.add_argument(
+        "--test-prefix",
+        type=str,
+        default=str(Path("data") / "rym_2025_jan_apr_tc300+0_bin200_test_shard"),
+        help="Prefix for BALANCED held-out test shards.",
+    )
+    parser.add_argument(
+        "--realtest-prefix",
+        type=str,
+        default=str(Path("data") / "rym_2025_jan_apr_tc300+0_unbalanced_realtest_shard"),
+        help="Prefix for UNBALANCED real-world test shards.",
+    )
+
+    parser.add_argument(
+        "--train-shards",
+        type=str,
+        default="all",
+        help="Train shard indices: 'all' or comma-separated list like '0,1,2'.",
+    )
+    parser.add_argument(
+        "--val-shards",
+        type=str,
+        default="all",
+        help="Val shard indices: 'all' or comma-separated list like '0,1'.",
+    )
+    parser.add_argument(
+        "--test-shards",
+        type=str,
+        default="all",
+        help="Test shard indices: 'all' or comma-separated list like '0,1'.",
+    )
+    parser.add_argument(
+        "--realtest-shards",
+        type=str,
+        default="all",
+        help="Real-world test shard indices: 'all' or comma-separated list like '0,1'.",
+    )
+
+    # Checkpointing
+    parser.add_argument(
+        "--ckpt-path",
+        type=str,
+        default="rym_experiment_ckpt.pt",
+        help="Path to save best model checkpoint + metrics.",
+    )
+
+    return parser
 
 
 def main() -> None:
-    args = parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="[run_rym_experiments] %(levelname)s: %(message)s",
     )
-    log = logging.getLogger("run_rym_experiments")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    pgn_prefix = Path(args.pgn_prefix)
-    npz_prefix = Path(args.npz_prefix)
+    # Discover shard paths according to the user's spec.
+    train_shards = discover_shards(args.train_prefix, args.train_shards)
+    val_shards = discover_shards(args.val_prefix, args.val_shards)
+    test_shards = discover_shards(args.test_prefix, args.test_shards)
+    realtest_shards = discover_shards(args.realtest_prefix, args.realtest_shards)
 
-    # 1) Ensure NPZs exist for train/val (test NPZ optional here)
-    train_npz = ensure_npz_for_split(
-        "train",
-        pgn_prefix=pgn_prefix,
-        npz_prefix=npz_prefix,
-        min_rating=args.min_rating,
-        max_rating=args.max_rating,
-        num_bins=args.num_bins,
-        force_rebuild=args.force_rebuild_npz,
-    )
-    val_npz = ensure_npz_for_split(
-        "val",
-        pgn_prefix=pgn_prefix,
-        npz_prefix=npz_prefix,
-        min_rating=args.min_rating,
-        max_rating=args.max_rating,
-        num_bins=args.num_bins,
-        force_rebuild=args.force_rebuild_npz,
+    if not train_shards:
+        raise RuntimeError("No train shards discovered; cannot run experiment.")
+    if not val_shards:
+        raise RuntimeError("No val shards discovered; cannot run experiment.")
+
+    # Infer num_bins / rating range and ensure consistency across all shards we will touch.
+    meta = infer_rating_metadata(train_shards + val_shards + test_shards + realtest_shards)
+    num_bins = int(meta["num_bins"])
+    min_rating = float(meta["min_rating"])
+    max_rating = float(meta["max_rating"])
+
+    log.info(
+        "Rating meta: num_bins=%d, min_rating=%.1f, max_rating=%.1f",
+        num_bins,
+        min_rating,
+        max_rating,
     )
 
-    # (Optional) ensure test NPZ too, for later evaluation
-    try:
-        ensure_npz_for_split(
-            "test",
-            pgn_prefix=pgn_prefix,
-            npz_prefix=npz_prefix,
-            min_rating=args.min_rating,
-            max_rating=args.max_rating,
-            num_bins=args.num_bins,
-            force_rebuild=args.force_rebuild_npz,
-        )
-    except FileNotFoundError:
-        log.warning("No test PGN found; skipping test NPZ build.")
-
-    # 2) Build loaders
-    train_loader, val_loader, num_bins = build_loaders(
-        train_npz,
-        val_npz,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
     device = torch.device(args.device)
     log.info("Using device: %s", device)
 
-    # 3) Train each requested model family / config pair
-    model_types: Sequence[str] = parse_model_list(args.models)
-    config_ids: List[int] = parse_config_ids(args.config_id)
+    # Build model + optimiser
+    model = get_model(
+        model_type=args.model_type,
+        num_planes=NUM_PLANES,
+        num_bins=num_bins,
+        config_id=args.config_id,
+    ).to(device)
 
-    if args.save_dir is not None:
-        save_dir = Path(args.save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        save_dir = None
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for model_type in model_types:
-        for cfg in config_ids:
-            log.info("=" * 80)
-            log.info(
-                "Training model_type=%s, config_id=%d, num_bins=%d",
-                model_type,
-                cfg,
-                num_bins,
-            )
-            log.info("=" * 80)
+    # Main training loop
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_val_metrics: Dict[str, Any] = {}
+    best_test_metrics: Dict[str, Any] = {}
+    best_realtest_metrics: Dict[str, Any] = {}
 
-            model = get_model(
-                model_type=model_type,
-                num_planes=NUM_PLANES,
-                num_bins=num_bins,
-                config_id=cfg,
-            ).to(device)
+    for epoch in range(1, args.epochs + 1):
+        log.info("Epoch %d/%d", epoch, args.epochs)
 
-            log.info("Model:\n%s", model)
+        train_metrics = train_over_shards(
+            model,
+            optimizer,
+            train_shards,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            alpha_reg=args.alpha_reg,
+            lambda_ent=args.lambda_ent,
+        )
 
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        val_metrics = evaluate_over_shards(
+            model,
+            val_shards,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            min_rating=min_rating,
+            max_rating=max_rating,
+            alpha_reg=args.alpha_reg,
+            lambda_ent=args.lambda_ent,
+        )
 
-            for epoch in range(1, args.epochs + 1):
-                log.info("Epoch %d/%d", epoch, args.epochs)
+        log.info(
+            "  [train] loss=%.4f cls=%.4f reg=%.4f",
+            train_metrics["loss"],
+            train_metrics["loss_cls"],
+            train_metrics["loss_reg"],
+        )
+        log.info(
+            "  [val]   loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
+            val_metrics["loss"],
+            val_metrics["loss_cls"],
+            val_metrics["loss_reg"],
+            val_metrics["acc"],
+            val_metrics["mae_rating"],
+        )
 
-                train_metrics = train_one_epoch_tqdm(
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_epoch = epoch
+            best_val_metrics = dict(val_metrics)
+
+            # When we get a new best val, also evaluate on test / realtest shards (if any)
+            if test_shards:
+                log.info("Evaluating on BALANCED held-out test shards...")
+                best_test_metrics = evaluate_over_shards(
                     model,
-                    train_loader,
-                    optimizer,
+                    test_shards,
                     device=device,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    min_rating=min_rating,
+                    max_rating=max_rating,
                     alpha_reg=args.alpha_reg,
+                    lambda_ent=args.lambda_ent,
                 )
-                val_metrics = evaluate_tqdm(
+                log.info(
+                    "  [test]  loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
+                    best_test_metrics["loss"],
+                    best_test_metrics["loss_cls"],
+                    best_test_metrics["loss_reg"],
+                    best_test_metrics["acc"],
+                    best_test_metrics["mae_rating"],
+                )
+
+            if realtest_shards:
+                log.info("Evaluating on UNBALANCED real-world test shards...")
+                best_realtest_metrics = evaluate_over_shards(
                     model,
-                    val_loader,
+                    realtest_shards,
                     device=device,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    min_rating=min_rating,
+                    max_rating=max_rating,
                     alpha_reg=args.alpha_reg,
-                )
-
-                log.info(
-                    "  train: loss=%.4f (cls=%.4f, reg=%.4f)",
-                    train_metrics["loss"],
-                    train_metrics["loss_cls"],
-                    train_metrics["loss_reg"],
+                    lambda_ent=args.lambda_ent,
                 )
                 log.info(
-                    "  val  : loss=%.4f (cls=%.4f, reg=%.4f), acc=%.3f, MAE=%.1f",
-                    val_metrics["loss"],
-                    val_metrics["loss_cls"],
-                    val_metrics["loss_reg"],
-                    val_metrics["acc"],
-                    val_metrics["mae_rating"],
+                    "  [real]  loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
+                    best_realtest_metrics["loss"],
+                    best_realtest_metrics["loss_cls"],
+                    best_realtest_metrics["loss_reg"],
+                    best_realtest_metrics["acc"],
+                    best_realtest_metrics["mae_rating"],
                 )
 
-            if save_dir is not None:
-                save_path = save_dir / f"rym_{model_type}_cfg{cfg}.pt"
-                torch.save(
-                    {
-                        "model_state": model.state_dict(),
-                        "model_type": model_type,
-                        "config_id": cfg,
-                        "num_planes": NUM_PLANES,
-                        "num_bins": num_bins,
-                    },
-                    save_path,
-                )
-                log.info("Saved checkpoint to %s", save_path)
+    log.info("Best val loss: %.4f (epoch %d)", best_val_loss, best_epoch)
+
+    # Save best checkpoint
+    ckpt_path = Path(args.ckpt_path)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_type": args.model_type,
+            "config_id": args.config_id,
+            "num_planes": NUM_PLANES,
+            "num_bins": num_bins,
+            "min_rating": min_rating,
+            "max_rating": max_rating,
+            "best_epoch": best_epoch,
+            "best_val_metrics": best_val_metrics,
+            "test_metrics": best_test_metrics,
+            "realtest_metrics": best_realtest_metrics,
+            "alpha_reg": args.alpha_reg,
+            "lambda_ent": args.lambda_ent,
+        },
+        ckpt_path,
+    )
+    log.info("Saved checkpoint + metrics to %s", ckpt_path)
 
 
 if __name__ == "__main__":
     main()
-
-"""
-python -m scripts.run_rym_experiments \
---pgn-prefix data/rym_2017-04_bin_1000 \
---npz-prefix data/rym_2017-04 \
---min-rating 800 --max-rating 2300 --num-bins 15 \
---models all \
---config-id all \
---epochs 5 \
---batch-size 256 \
---device cuda \
---save-dir models/rym_2017-04_baselines
-"""

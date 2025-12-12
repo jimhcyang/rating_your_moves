@@ -43,12 +43,12 @@ class RYMNpzDataset(Dataset):
 
     def __init__(self, npz_path: Path) -> None:
         super().__init__()
-        log.info("Loading NPZ dataset: %s", npz_path)
-        data = np.load(npz_path)
+        self.path = Path(npz_path)
+        data = np.load(self.path)
 
-        self.X = data["X"]          # (N, C, 8, 8)
-        self.y_bin = data["y_bin"]  # (N,)
-        self.y_elo = data["y_elo"]  # (N,)
+        self.X = data["X"]  # (N, C, 8, 8), uint8
+        self.y_bin = data["y_bin"]
+        self.y_elo = data["y_elo"]
 
         self.game_id = data.get("game_id", None)
         self.ply_idx = data.get("ply_idx", None)
@@ -61,20 +61,22 @@ class RYMNpzDataset(Dataset):
         self.max_rating = float(data.get("max_rating", 0.0))
 
         log.info(
-            "Loaded %d samples, num_bins=%d, min_rating=%.1f, max_rating=%.1f",
+            "Loaded %d samples from %s (num_bins=%d, min_rating=%.1f, max_rating=%.1f)",
             self.N,
+            self.path,
             self.num_bins,
             self.min_rating,
             self.max_rating,
         )
 
-    def __len__(self) -> int:
+    def __len__(self) -> int:  # type: ignore[override]
         return self.N
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        x = torch.from_numpy(self.X[idx]).float()  # (C, 8, 8)
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:  # type: ignore[override]
+        x = torch.from_numpy(self.X[idx]).to(torch.float32)  # (C, 8, 8)
         yb = int(self.y_bin[idx])
         ye = float(self.y_elo[idx])
+
         return {
             "X": x,
             "y_bin": torch.tensor(yb, dtype=torch.long),
@@ -83,7 +85,7 @@ class RYMNpzDataset(Dataset):
 
 
 # ---------------------------------------------------------------------
-# Loss: distance-aware classification + band-normalised regression
+# Loss: distance-aware classification + optional regression + entropy
 # ---------------------------------------------------------------------
 
 
@@ -96,18 +98,21 @@ def compute_losses(
     min_rating: float,
     max_rating: float,
     alpha_reg: float,
+    lambda_ent: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute a joint loss where:
 
       * Classification loss is the expected squared distance between
         predicted band and true band (in *band index* units).
-      * Regression loss is squared error in Elo, but normalised by the
-        band width so that both losses live in (approx) "bands^2" units.
+      * Regression loss (optional) is squared error in Elo, but normalised
+        by the band width so that it is also in "band units".
+      * Optionally, an entropy bonus encourages non-degenerate
+        probability distributions over bands.
 
-    This makes classification and regression terms comparable, and
-    classification is naturally penalised more when probability mass
-    is far from the true band.
+    When alpha_reg == 0, the regression part is skipped entirely so we
+    don't waste compute on it. When lambda_ent == 0 we omit the entropy
+    term and recover the original distance-aware loss.
     """
     # logits: (B, num_bins)
     B, num_bins = logits.shape
@@ -124,21 +129,32 @@ def compute_losses(
     per_sample_cls = (probs * sq_dist).sum(dim=1)  # E[(k - y)^2]
     loss_cls = per_sample_cls.mean()
 
+    # Optional entropy bonus to discourage over-confident spikes
+    if lambda_ent > 0.0:
+        # Small clamp to avoid log(0)
+        log_probs = (probs + 1e-8).log()
+        entropy = -(probs * log_probs).sum(dim=1).mean()
+        # Minimise (distance - λ * entropy):
+        loss_cls = loss_cls - lambda_ent * entropy
+
     # 2) Regression loss, measured in "number of bands"
-    band_width = (max_rating - min_rating) / float(num_bins)
-    if band_width <= 0:
-        raise ValueError(
-            f"Non-positive band width: min_rating={min_rating}, "
-            f"max_rating={max_rating}, num_bins={num_bins}"
-        )
+    if alpha_reg > 0.0:
+        band_width = (max_rating - min_rating) / float(num_bins)
+        if band_width <= 0:
+            raise ValueError(
+                f"Non-positive band width: min_rating={min_rating}, "
+                f"max_rating={max_rating}, num_bins={num_bins}"
+            )
+        y_elo = y_elo.to(device=device, dtype=torch.float32)
+        rating_pred = rating_pred.to(device=device, dtype=torch.float32)
+        diff_in_bands = (rating_pred - y_elo) / band_width
+        loss_reg = (diff_in_bands ** 2).mean()
+        loss = loss_cls + alpha_reg * loss_reg
+    else:
+        # Completely skip regression if alpha_reg==0
+        loss_reg = torch.zeros((), device=device, dtype=loss_cls.dtype)
+        loss = loss_cls
 
-    y_elo = y_elo.to(device=device, dtype=torch.float32)
-    rating_pred = rating_pred.to(device=device, dtype=torch.float32)
-
-    diff_in_bands = (rating_pred - y_elo) / band_width
-    loss_reg = (diff_in_bands ** 2).mean()
-
-    loss = loss_cls + alpha_reg * loss_reg
     return {
         "loss": loss,
         "loss_cls": loss_cls,
@@ -160,6 +176,7 @@ def train_one_epoch(
     min_rating: float,
     max_rating: float,
     alpha_reg: float,
+    lambda_ent: float = 0.0,
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -168,11 +185,13 @@ def train_one_epoch(
     n_samples = 0
 
     for batch in loader:
-        X = batch["X"].to(device)
-        y_bin = batch["y_bin"].to(device)
-        y_elo = batch["y_elo"].to(device)
+        X = batch["X"].to(device=device, dtype=torch.float32)
+        y_bin = batch["y_bin"].to(device=device, dtype=torch.long)
+        y_elo = batch["y_elo"].to(device=device, dtype=torch.float32)
 
-        logits, rating_pred = model(X)
+        optimizer.zero_grad(set_to_none=True)
+        logits, rating_pred = model(X)  # (B, K), (B,)
+
         losses = compute_losses(
             logits,
             rating_pred,
@@ -181,18 +200,21 @@ def train_one_epoch(
             min_rating=min_rating,
             max_rating=max_rating,
             alpha_reg=alpha_reg,
+            lambda_ent=lambda_ent,
         )
-        loss = losses["loss"]
 
-        optimizer.zero_grad()
+        loss = losses["loss"]
         loss.backward()
         optimizer.step()
 
         B = X.size(0)
-        total_loss += float(losses["loss"].item()) * B
+        total_loss += float(loss.item()) * B
         total_cls += float(losses["loss_cls"].item()) * B
         total_reg += float(losses["loss_reg"].item()) * B
         n_samples += B
+
+    if n_samples == 0:
+        raise RuntimeError("No samples seen in train_one_epoch.")
 
     return {
         "loss": total_loss / n_samples,
@@ -210,6 +232,7 @@ def evaluate(
     min_rating: float,
     max_rating: float,
     alpha_reg: float,
+    lambda_ent: float = 0.0,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -219,12 +242,27 @@ def evaluate(
     total_samples = 0
     total_abs_err = 0.0
 
+    # Precompute band centers for an Elo-from-bands estimate
+    num_bins = None
+    centers = None
+
     for batch in loader:
-        X = batch["X"].to(device)
-        y_bin = batch["y_bin"].to(device)
-        y_elo = batch["y_elo"].to(device)
+        X = batch["X"].to(device=device, dtype=torch.float32)
+        y_bin = batch["y_bin"].to(device=device, dtype=torch.long)
+        y_elo = batch["y_elo"].to(device=device, dtype=torch.float32)
 
         logits, rating_pred = model(X)
+
+        # Discover num_bins from logits the first time through
+        if num_bins is None:
+            num_bins = logits.size(1)
+            band_width = (max_rating - min_rating) / float(num_bins)
+            centers = (
+                min_rating
+                + (torch.arange(num_bins, device=device, dtype=torch.float32) + 0.5)
+                * band_width
+            )
+
         losses = compute_losses(
             logits,
             rating_pred,
@@ -233,18 +271,26 @@ def evaluate(
             min_rating=min_rating,
             max_rating=max_rating,
             alpha_reg=alpha_reg,
+            lambda_ent=lambda_ent,
         )
 
         B = X.size(0)
         total_loss += float(losses["loss"].item()) * B
         total_cls += float(losses["loss_cls"].item()) * B
         total_reg += float(losses["loss_reg"].item()) * B
-
-        preds_bin = logits.argmax(dim=1)
-        total_correct += int((preds_bin == y_bin).sum().item())
         total_samples += B
 
-        total_abs_err += float(torch.abs(rating_pred - y_elo).sum().item())
+        # Classification accuracy
+        preds_bin = logits.argmax(dim=1)
+        total_correct += int((preds_bin == y_bin).sum().item())
+
+        # Elo MAE using the distribution over bands, not necessarily the reg head
+        probs = F.softmax(logits, dim=1)  # (B, num_bins)
+        rating_from_bands = (probs * centers.view(1, -1)).sum(dim=1)
+        total_abs_err += float(torch.abs(rating_from_bands - y_elo).sum().item())
+
+    if total_samples == 0:
+        raise RuntimeError("No samples seen in evaluate.")
 
     return {
         "loss": total_loss / total_samples,
@@ -253,45 +299,6 @@ def evaluate(
         "acc": total_correct / total_samples,
         "mae_rating": total_abs_err / total_samples,
     }
-
-
-# ---------------------------------------------------------------------
-# Bayesian over moves (optional post-processing)
-# ---------------------------------------------------------------------
-
-
-@torch.no_grad()
-def bayesian_update_sequence(
-    logits_seq: torch.Tensor,
-    prior: torch.Tensor | None = None,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    """
-    Given logits over rating bands for a single game:
-
-        logits_seq: (T, num_bins)
-
-    apply a simple sequential Bayes update:
-
-        p_0 ∝ prior (uniform if None)
-        p_t ∝ p_{t-1} * softmax(logits_t / temperature)
-
-    Returns final posterior p_T with shape (num_bins,).
-    """
-    probs = F.softmax(logits_seq / temperature, dim=-1)  # (T, num_bins)
-    T, num_bins = probs.shape
-
-    if prior is None:
-        p = torch.full((num_bins,), 1.0 / num_bins, device=probs.device)
-    else:
-        p = prior.to(probs.device)
-        p = p / p.sum()
-
-    for t in range(T):
-        p = p * probs[t]
-        p = p / p.sum()
-
-    return p
 
 
 # ---------------------------------------------------------------------
@@ -324,8 +331,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alpha-reg",
         type=float,
-        default=1.0,
-        help="Weight for regression loss vs classification loss.",
+        default=0.0,
+        help="Weight for regression loss vs classification loss (0.0 disables regression).",
+    )
+    parser.add_argument(
+        "--lambda-ent",
+        type=float,
+        default=0.0,
+        help="Entropy bonus weight in the classification loss (0.0 disables entropy term).",
     )
     parser.add_argument(
         "--device",
@@ -339,7 +352,7 @@ def parse_args() -> argparse.Namespace:
         "--save-path",
         type=str,
         default=None,
-        help="Optional path to save final model state_dict (.pt).",
+        help="Optional path to save final model checkpoint (.pt).",
     )
     return parser.parse_args()
 
@@ -363,7 +376,7 @@ def main() -> None:
 
     if (train_ds.min_rating != val_ds.min_rating) or (train_ds.max_rating != val_ds.max_rating):
         raise ValueError(
-            f"Train/val rating range mismatch: "
+            "Train/val rating range mismatch: "
             f"train=({train_ds.min_rating},{train_ds.max_rating}), "
             f"val=({val_ds.min_rating},{val_ds.max_rating})"
         )
@@ -396,9 +409,11 @@ def main() -> None:
         config_id=args.config_id,
     ).to(device)
 
-    log.info("Model: %s", model)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_val_metrics: Dict[str, Any] = {}
 
     for epoch in range(1, args.epochs + 1):
         log.info("Epoch %d/%d", epoch, args.epochs)
@@ -411,6 +426,7 @@ def main() -> None:
             min_rating=min_rating,
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
+            lambda_ent=args.lambda_ent,
         )
         val_metrics = evaluate(
             model,
@@ -419,22 +435,30 @@ def main() -> None:
             min_rating=min_rating,
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
+            lambda_ent=args.lambda_ent,
         )
 
         log.info(
-            "  train: loss=%.4f (cls=%.4f, reg=%.4f)",
+            "  [train] loss=%.4f cls=%.4f reg=%.4f",
             train_metrics["loss"],
             train_metrics["loss_cls"],
             train_metrics["loss_reg"],
         )
         log.info(
-            "  val  : loss=%.4f (cls=%.4f, reg=%.4f), acc=%.3f, MAE=%.1f",
+            "  [val]   loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
             val_metrics["loss"],
             val_metrics["loss_cls"],
             val_metrics["loss_reg"],
             val_metrics["acc"],
             val_metrics["mae_rating"],
         )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_epoch = epoch
+            best_val_metrics = dict(val_metrics)
+
+    log.info("Best val loss: %.4f (epoch %d)", best_val_loss, best_epoch)
 
     if args.save_path is not None:
         save_path = Path(args.save_path)
@@ -446,6 +470,10 @@ def main() -> None:
                 "config_id": args.config_id,
                 "num_planes": NUM_PLANES,
                 "num_bins": num_bins,
+                "min_rating": min_rating,
+                "max_rating": max_rating,
+                "best_epoch": best_epoch,
+                "best_val_metrics": best_val_metrics,
             },
             save_path,
         )
