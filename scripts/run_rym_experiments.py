@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .train_rym import RYMNpzDataset, train_one_epoch, evaluate  # type: ignore
+from .train_rym import RYMNpzDataset, train_one_epoch, evaluate, GAUSSIAN_LABEL_SIGMA  # type: ignore
 from .rym_models import get_model, MODEL_TYPES  # type: ignore
 from .ply_features import NUM_PLANES  # type: ignore
 
@@ -139,6 +139,7 @@ def train_over_shards(
     max_rating: float,
     alpha_reg: float,
     lambda_ent: float,
+    gaussian_sigma: float,
 ) -> Dict[str, float]:
     """
     Run one logical "epoch" over all train shards.
@@ -168,6 +169,7 @@ def train_over_shards(
             max_rating=max_rating,
             alpha_reg=alpha_reg,
             lambda_ent=lambda_ent,
+            gaussian_sigma=gaussian_sigma,
         )
 
         n = len(ds)
@@ -200,6 +202,7 @@ def evaluate_over_shards(
     max_rating: float,
     alpha_reg: float,
     lambda_ent: float,
+    gaussian_sigma: float,
 ) -> Dict[str, float]:
     """
     Evaluate a model over one or more shards, aggregating metrics
@@ -231,6 +234,7 @@ def evaluate_over_shards(
             max_rating=max_rating,
             alpha_reg=alpha_reg,
             lambda_ent=lambda_ent,
+            gaussian_sigma=gaussian_sigma,
         )
 
         n = len(ds)
@@ -304,6 +308,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Entropy bonus weight in the classification loss (0.0 disables entropy term).",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        default=GAUSSIAN_LABEL_SIGMA,
+        help="Std dev of the discrete Gaussian label in band units.",
     )
     parser.add_argument(
         "--device",
@@ -449,6 +459,7 @@ def main() -> None:
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
             lambda_ent=args.lambda_ent,
+            gaussian_sigma=args.gaussian_sigma,
         )
 
         val_metrics = evaluate_over_shards(
@@ -461,6 +472,7 @@ def main() -> None:
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
             lambda_ent=args.lambda_ent,
+            gaussian_sigma=args.gaussian_sigma,
         )
 
         log.info(
@@ -496,6 +508,7 @@ def main() -> None:
                     max_rating=max_rating,
                     alpha_reg=args.alpha_reg,
                     lambda_ent=args.lambda_ent,
+                    gaussian_sigma=args.gaussian_sigma,
                 )
                 log.info(
                     "  [test]  loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
@@ -518,6 +531,7 @@ def main() -> None:
                     max_rating=max_rating,
                     alpha_reg=args.alpha_reg,
                     lambda_ent=args.lambda_ent,
+                    gaussian_sigma=args.gaussian_sigma,
                 )
                 log.info(
                     "  [real]  loss=%.4f cls=%.4f reg=%.4f acc=%.4f mae=%.2f",
@@ -548,6 +562,7 @@ def main() -> None:
             "realtest_metrics": best_realtest_metrics,
             "alpha_reg": args.alpha_reg,
             "lambda_ent": args.lambda_ent,
+            "gaussian_sigma": args.gaussian_sigma,
         },
         ckpt_path,
     )

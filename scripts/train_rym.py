@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Tuple, Any
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from .rym_models import get_model, MODEL_TYPES  # type: ignore
 
 log = logging.getLogger("train_rym")
 
+GAUSSIAN_LABEL_SIGMA = 1.0
 
 # ---------------------------------------------------------------------
 # Dataset
@@ -88,10 +89,9 @@ class RYMNpzDataset(Dataset):
 # Loss: distance-aware classification + optional regression + entropy
 # ---------------------------------------------------------------------
 
-
 def compute_losses(
     logits: torch.Tensor,
-    rating_pred: torch.Tensor,
+    rating_pred: torch.Tensor,  # kept for API compatibility, not used if alpha_reg == 0
     y_bin: torch.Tensor,
     y_elo: torch.Tensor,
     *,
@@ -99,68 +99,69 @@ def compute_losses(
     max_rating: float,
     alpha_reg: float,
     lambda_ent: float = 0.0,
-) -> Dict[str, torch.Tensor]:
+    gaussian_sigma: float = GAUSSIAN_LABEL_SIGMA,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute a joint loss where:
+    Compute classification + optional regression loss.
 
-      * Classification loss is the expected squared distance between
-        predicted band and true band (in *band index* units).
-      * Regression loss (optional) is squared error in Elo, but normalised
-        by the band width so that it is also in "band units".
-      * Optionally, an entropy bonus encourages non-degenerate
-        probability distributions over bands.
+    Classification:
+        - Distance-aware, *soft* cross-entropy in band index.
+        - Target distribution is a discrete Gaussian over bands centered at y_bin,
+          with standard deviation gaussian_sigma in band units.
 
-    When alpha_reg == 0, the regression part is skipped entirely so we
-    don't waste compute on it. When lambda_ent == 0 we omit the entropy
-    term and recover the original distance-aware loss.
+    Regression (optional):
+        - Elo is defined as the expectation of Elo under the predicted band
+          distribution. If alpha_reg == 0, regression is disabled.
     """
-    # logits: (B, num_bins)
-    B, num_bins = logits.shape
     device = logits.device
+    y_bin = y_bin.to(device)
+    y_elo = y_elo.to(device).float()
 
-    # 1) Distance-aware classification loss
-    probs = F.softmax(logits, dim=1)  # (B, num_bins)
+    # Number of bands from logits
+    num_bins = logits.size(1)
 
-    bin_idx = torch.arange(num_bins, device=device, dtype=torch.float32).view(1, -1)  # (1, K)
-    y = y_bin.to(device=device, dtype=torch.float32).view(-1, 1)  # (B, 1)
+    # ------------------------------------------------------------------
+    # 1) Classification: Gaussian soft labels in band index
+    # ------------------------------------------------------------------
+    idx = torch.arange(num_bins, device=device).view(1, -1)  # (1, K)
+    diff2 = (idx - y_bin.view(-1, 1)).float().pow(2)        # (B, K)
 
-    # Squared distance (in band index units) for every (sample, bin)
-    sq_dist = (bin_idx - y) ** 2  # (B, K)
-    per_sample_cls = (probs * sq_dist).sum(dim=1)  # E[(k - y)^2]
+    sigma2 = float(gaussian_sigma) ** 2
+    target_logits = -diff2 / (2.0 * sigma2)                 # (B, K)
+    target_probs = torch.softmax(target_logits, dim=1)      # (B, K)
+
+    log_probs = torch.log_softmax(logits, dim=1)            # (B, K)
+    per_sample_cls = -(target_probs * log_probs).sum(dim=1)  # (B,)
     loss_cls = per_sample_cls.mean()
 
-    # Optional entropy bonus to discourage over-confident spikes
+    # Optional entropy bonus on the *prediction* (encourages spread)
     if lambda_ent > 0.0:
-        # Small clamp to avoid log(0)
-        log_probs = (probs + 1e-8).log()
-        entropy = -(probs * log_probs).sum(dim=1).mean()
-        # Minimise (distance - λ * entropy):
+        probs = torch.softmax(logits, dim=1)                 # (B, K)
+        entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1).mean()
         loss_cls = loss_cls - lambda_ent * entropy
 
-    # 2) Regression loss, measured in "number of bands"
+    # ------------------------------------------------------------------
+    # 2) Regression (optional): Elo as expectation of Elo under bands
+    # ------------------------------------------------------------------
     if alpha_reg > 0.0:
-        band_width = (max_rating - min_rating) / float(num_bins)
-        if band_width <= 0:
-            raise ValueError(
-                f"Non-positive band width: min_rating={min_rating}, "
-                f"max_rating={max_rating}, num_bins={num_bins}"
-            )
-        y_elo = y_elo.to(device=device, dtype=torch.float32)
-        rating_pred = rating_pred.to(device=device, dtype=torch.float32)
-        diff_in_bands = (rating_pred - y_elo) / band_width
-        loss_reg = (diff_in_bands ** 2).mean()
+        band_width = float(max_rating - min_rating) / float(num_bins)
+        band_centers = torch.linspace(
+            min_rating + 0.5 * band_width,
+            max_rating - 0.5 * band_width,
+            steps=num_bins,
+            device=device,
+        )  # (K,)
+
+        probs = torch.softmax(logits, dim=1)                 # (B, K)
+        rating_from_bands = (probs * band_centers.view(1, -1)).sum(dim=1)  # (B,)
+
+        loss_reg = F.mse_loss(rating_from_bands, y_elo)
         loss = loss_cls + alpha_reg * loss_reg
     else:
-        # Completely skip regression if alpha_reg==0
-        loss_reg = torch.zeros((), device=device, dtype=loss_cls.dtype)
+        loss_reg = logits.new_tensor(0.0)
         loss = loss_cls
 
-    return {
-        "loss": loss,
-        "loss_cls": loss_cls,
-        "loss_reg": loss_reg,
-    }
-
+    return loss, loss_cls, loss_reg
 
 # ---------------------------------------------------------------------
 # Training / evaluation
@@ -177,6 +178,7 @@ def train_one_epoch(
     max_rating: float,
     alpha_reg: float,
     lambda_ent: float = 0.0,
+    gaussian_sigma: float = GAUSSIAN_LABEL_SIGMA,
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -192,7 +194,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         logits, rating_pred = model(X)  # (B, K), (B,)
 
-        losses = compute_losses(
+        loss, loss_cls, loss_reg = compute_losses(
             logits,
             rating_pred,
             y_bin,
@@ -201,16 +203,16 @@ def train_one_epoch(
             max_rating=max_rating,
             alpha_reg=alpha_reg,
             lambda_ent=lambda_ent,
+            gaussian_sigma=gaussian_sigma,
         )
 
-        loss = losses["loss"]
         loss.backward()
         optimizer.step()
 
         B = X.size(0)
         total_loss += float(loss.item()) * B
-        total_cls += float(losses["loss_cls"].item()) * B
-        total_reg += float(losses["loss_reg"].item()) * B
+        total_cls += float(loss_cls.item()) * B
+        total_reg += float(loss_reg.item()) * B
         n_samples += B
 
     if n_samples == 0:
@@ -233,6 +235,7 @@ def evaluate(
     max_rating: float,
     alpha_reg: float,
     lambda_ent: float = 0.0,
+    gaussian_sigma: float = GAUSSIAN_LABEL_SIGMA,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -263,7 +266,7 @@ def evaluate(
                 * band_width
             )
 
-        losses = compute_losses(
+        loss, loss_cls, loss_reg = compute_losses(
             logits,
             rating_pred,
             y_bin,
@@ -272,12 +275,13 @@ def evaluate(
             max_rating=max_rating,
             alpha_reg=alpha_reg,
             lambda_ent=lambda_ent,
+            gaussian_sigma=gaussian_sigma,
         )
 
         B = X.size(0)
-        total_loss += float(losses["loss"].item()) * B
-        total_cls += float(losses["loss_cls"].item()) * B
-        total_reg += float(losses["loss_reg"].item()) * B
+        total_loss += float(loss.item()) * B
+        total_cls += float(loss_cls.item()) * B
+        total_reg += float(loss_reg.item()) * B
         total_samples += B
 
         # Classification accuracy
@@ -324,6 +328,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Small discrete config index (0..3) within that family.",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        default=GAUSSIAN_LABEL_SIGMA,
+        help="Std dev of the discrete Gaussian label in band units (default: 1.0).",
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
@@ -427,6 +437,7 @@ def main() -> None:
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
             lambda_ent=args.lambda_ent,
+            gaussian_sigma=args.gaussian_sigma,
         )
         val_metrics = evaluate(
             model,
@@ -436,6 +447,7 @@ def main() -> None:
             max_rating=max_rating,
             alpha_reg=args.alpha_reg,
             lambda_ent=args.lambda_ent,
+            gaussian_sigma=args.gaussian_sigma,
         )
 
         log.info(
