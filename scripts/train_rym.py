@@ -105,6 +105,7 @@ def compute_losses(
     Compute classification + optional regression loss.
 
     Classification:
+        - If gaussian_sigma < 0: standard hard-label cross entropy on y_bin.
         - Distance-aware, *soft* cross-entropy in band index.
         - Target distribution is a discrete Gaussian over bands centered at y_bin,
           with standard deviation gaussian_sigma in band units.
@@ -123,16 +124,25 @@ def compute_losses(
     # ------------------------------------------------------------------
     # 1) Classification: Gaussian soft labels in band index
     # ------------------------------------------------------------------
-    idx = torch.arange(num_bins, device=device).view(1, -1)  # (1, K)
-    diff2 = (idx - y_bin.view(-1, 1)).float().pow(2)        # (B, K)
 
-    sigma2 = float(gaussian_sigma) ** 2
-    target_logits = -diff2 / (2.0 * sigma2)                 # (B, K)
-    target_probs = torch.softmax(target_logits, dim=1)      # (B, K)
+    if gaussian_sigma < 0:
+        # Hard-label CE
+        loss_cls = F.cross_entropy(logits, y_bin, reduction="mean")
+    else:
+        if gaussian_sigma <= 0:
+            raise ValueError(
+                f"gaussian_sigma must be > 0 for soft labels, or < 0 for CE. Got {gaussian_sigma}."
+            )
+        idx = torch.arange(num_bins, device=device).view(1, -1)  # (1, K)
+        diff2 = (idx - y_bin.view(-1, 1)).float().pow(2)        # (B, K)
 
-    log_probs = torch.log_softmax(logits, dim=1)            # (B, K)
-    per_sample_cls = -(target_probs * log_probs).sum(dim=1)  # (B,)
-    loss_cls = per_sample_cls.mean()
+        sigma2 = float(gaussian_sigma) ** 2
+        target_logits = -diff2 / (2.0 * sigma2)                 # (B, K)
+        target_probs = torch.softmax(target_logits, dim=1)      # (B, K)
+
+        log_probs = torch.log_softmax(logits, dim=1)            # (B, K)
+        per_sample_cls = -(target_probs * log_probs).sum(dim=1)  # (B,)
+        loss_cls = per_sample_cls.mean()
 
     # Optional entropy bonus on the *prediction* (encourages spread)
     if lambda_ent > 0.0:
@@ -144,7 +154,7 @@ def compute_losses(
     # 2) Regression (optional): Elo as expectation of Elo under bands
     # ------------------------------------------------------------------
     if alpha_reg > 0.0:
-        band_width = float(max_rating - min_rating) / float(num_bins)
+        band_width = logits.new_tensor((max_rating - min_rating) / float(num_bins))
         band_centers = torch.linspace(
             min_rating + 0.5 * band_width,
             max_rating - 0.5 * band_width,
@@ -152,10 +162,11 @@ def compute_losses(
             device=device,
         )  # (K,)
 
-        probs = torch.softmax(logits, dim=1)                 # (B, K)
+        probs = torch.softmax(logits, dim=1)  # (B, K)
         rating_from_bands = (probs * band_centers.view(1, -1)).sum(dim=1)  # (B,)
 
-        loss_reg = F.mse_loss(rating_from_bands, y_elo)
+        err = (rating_from_bands - y_elo) / band_width
+        loss_reg = (err * err).mean()
         loss = loss_cls + alpha_reg * loss_reg
     else:
         loss_reg = logits.new_tensor(0.0)
@@ -333,7 +344,7 @@ def parse_args() -> argparse.Namespace:
         "--gaussian-sigma",
         type=float,
         default=GAUSSIAN_LABEL_SIGMA,
-        help="Std dev of the discrete Gaussian label in band units (default: 1.0).",
+        help="Std dev of the discrete Gaussian label in band units. Use -1 to switch to hard-label CE.",
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
