@@ -1,5 +1,7 @@
 # Rating Your Moves (RYM)
 
+**[Explore the website](https://jimhcyang.github.io/rating_your_moves/)** — a concise study and an interactive, move-by-move example of latent skill inference.
+
 This repository implements a complete data + modeling pipeline for studying how human chess moves reveal playing strength, using large scale Lichess game archives.
 
 Conceptually:

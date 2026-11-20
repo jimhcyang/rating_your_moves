@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Move explorer — Rating Your Moves</title>
+  <link rel="stylesheet" href="assets/demo.css">
+  <script src="assets/demo-data.js" defer></script>
+  <script src="assets/demo.js" defer></script>
+</head>
+<body>
+<main id="explorer" aria-label="Move-by-move skill explorer">
+  <div class="demo-grid">
+    <section class="board-card card" aria-label="Chess game replay">
+      <div class="move-heading">
+        <span id="move-label" aria-live="polite" aria-atomic="true"></span>
+        <span id="move-count" class="move-count"></span>
+      </div>
+      <div class="player"><span class="piece-dot black" aria-hidden="true"></span><span>Charles1ee</span><span class="player-rating">1723</span></div>
+      <div id="board" role="img" aria-label="Chess position before the selected move"></div>
+      <div class="player"><span class="piece-dot white" aria-hidden="true"></span><span>WelchesGrape</span><span class="player-rating">1689</span></div>
+      <div class="controls" role="group" aria-label="Move navigation" aria-describedby="keyboard-hint">
+        <button id="start" type="button" aria-label="First move" title="First move"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5v10m9-10-6 5 6 5"/></svg></button>
+        <button id="prev" type="button" aria-label="Previous move"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12 5-5 5 5 5"/></svg><span>Back</span></button>
+        <button id="next" type="button" class="primary" aria-label="Next move"><span>Next</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5"/></svg></button>
+        <button id="end" type="button" aria-label="Last move" title="Last move"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15 5v10M6 5l6 5-6 5"/></svg></button>
+      </div>
+      <p class="board-hint" id="keyboard-hint">Before the move. The arrow shows the choice.<br><span>Use ← → with a navigation button focused.</span></p>
+      <div class="game-meta">
+        <span>5 min blitz · Black won · Jan 25, 2026</span>
+        <a href="https://www.chess.com/analysis/game/live/148465731420/analysis" target="_blank" rel="noopener noreferrer">Chess.com game</a>
+        <span class="rating-note">Player ratings above are from the Chess.com game header.</span>
+      </div>
+    </section>
+    <section class="evidence" aria-label="Rating evidence and estimates">
+      <div class="estimate-card card">
+        <div><p class="eyebrow" id="estimate-label">White’s estimated skill</p><p id="summary" class="estimate-value"></p></div>
+        <p class="estimate-note">Before <span aria-hidden="true">→</span> after this move<br><span>Lichess rating scale</span></p>
+      </div>
+      <div class="charts">
+        <section class="chart-card card" aria-labelledby="evidence-title">
+          <h2 id="evidence-title">Evidence from this move</h2>
+          <div class="chart-key"><span><i class="key-line selected-color"></i>Relative evidence</span><span><i class="key-line gray"></i>Move probability</span></div>
+          <div id="likelihood"></div>
+        </section>
+        <section class="chart-card card" aria-labelledby="posterior-title">
+          <h2 id="posterior-title">The belief update</h2>
+          <div class="chart-key"><span><i class="key-line selected-color"></i>After</span><span><i class="key-line dashed"></i>Before</span></div>
+          <div id="posterior"></div>
+        </section>
+        <section class="chart-card trajectory-card card" aria-labelledby="trajectory-title">
+          <div class="chart-heading"><h2 id="trajectory-title">Skill across the game</h2><div class="chart-key"><span><i class="key-line blue"></i>White</span><span><i class="key-line red"></i>Black</span></div></div>
+          <div id="trajectory"></div>
+          <p class="chart-note">Shaded bands contain approximately 50% posterior mass. Each player updates separately.</p>
+        </section>
+      </div>
+      <p class="demo-note">Exploratory estimates on the Lichess scale, not directly comparable to the Chess.com ratings. Gray curve: raw move probability, read on the right axis.</p>
+    </section>
+  </div>
+  <noscript><p class="demo-note">Enable JavaScript to explore the 52 moves in this game.</p></noscript>
+</main>
+</body>
+</html>
