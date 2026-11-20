@@ -35,5 +35,6 @@
     if (replay.open) img.src = img.dataset.src;
     else img.removeAttribute('src');
   });
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) replay.open = false;
   showView();
 })();

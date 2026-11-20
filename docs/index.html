@@ -47,73 +47,89 @@
         <p class="eyebrow">Research notes <span aria-hidden="true">/</span> Jim Yang</p>
         <h1 id="study-title">What does a move<br><span>say about you?</span></h1>
         <p class="hero-description">Looking beyond the result to the skill behind each decision.</p>
-        <p class="study-credit">Adapted from the original Rating Your Moves study.</p>
       </div>
 
       <article class="study-article">
-        <div class="prose opening">
-          <p>A result tells us who won. A sequence of decisions tells a richer story. <strong>Rating Your Moves</strong> asks how much we can infer about a player’s strength from the moves they choose—and how certain we should be.</p>
-          <p>Chess makes latent skill tangible: the board is visible, the decision is observable, but the ability behind it is hidden.</p>
+        <div class="study-opening">
+          <div class="prose opening">
+            <p>A result tells us who won. A sequence of decisions tells a richer story.</p>
+            <p><strong>Rating Your Moves</strong> asks how much we can infer about a player’s strength from the moves they choose—and how certain we should be. The board is visible. The decision is observable. The ability behind it is hidden.</p>
+          </div>
+          <blockquote class="chess-quote opening-quote">
+            <p>“The mistakes are all there on the board, waiting to be made.”</p>
+            <cite>Savielly Tartakower</cite>
+          </blockquote>
         </div>
 
-        <section class="article-section">
+        <section class="article-section editorial-row data-section">
           <div class="prose">
             <p class="section-label">The data</p>
-            <h2>Start with human decisions.</h2>
-            <p>The original study uses Lichess 5+0 blitz games, with ten 200-point rating bands spanning 400–2400. Balanced training samples keep the most common ratings from dominating; an unbalanced test sample preserves the natural rating mix.</p>
+            <h2>Start with<br>human decisions.</h2>
+            <p>The study focuses on Lichess 5+0 blitz games, with ten 200-point rating bands spanning 400–2400. Balanced training samples keep common ratings from dominating; an unbalanced test sample preserves the natural rating mix.</p>
+            <blockquote class="chess-quote inline-quote">
+              <p>“Chess is the art of analysis.”</p>
+              <cite>Mikhail Botvinnik</cite>
+            </blockquote>
           </div>
           <figure class="study-figure landscape">
             <a href="assets/study/rating-time-control-distribution.png" target="_blank" rel="noopener" aria-label="Open the rating and time-control distribution at full resolution"><img src="assets/study/rating-time-control-distribution.png" alt="Heatmap of the source archive's games across rating bands and time controls, showing an uneven distribution." width="1800" height="990" loading="lazy"></a>
-            <figcaption>Archive overview across time controls, on a logarithmic scale. The study focuses on 5+0 blitz.</figcaption>
+            <figcaption>Games across rating bands and time controls. A logarithmic scale reveals the uneven distribution in the archive.</figcaption>
           </figure>
         </section>
 
-        <section class="article-section">
+        <section class="article-section editorial-row representation-section">
           <div class="prose">
             <p class="section-label">The representation</p>
-            <h2>One board. Sixty-four views.</h2>
-            <p>Each half-move becomes a <strong>64 × 8 × 8</strong> representation: piece locations, square control, and the change made by the move. Neural classifiers turn these layers into a distribution over rating bands. In this original pipeline, the target is the two players’ average rating.</p>
+            <h2>One board.<br>Sixty-four views.</h2>
+            <p>To us, a position is one chessboard. For a rating classifier, each half-move becomes a <strong>64 × 8 × 8</strong> representation of piece locations, square control, and the change made by the move.</p>
+            <p>These layers reveal the structure of a decision. Neural classifiers turn them into a distribution over rating bands, using the two players’ average rating as the training target.</p>
           </div>
           <figure class="study-figure square">
             <a href="assets/study/board-feature-planes.png" target="_blank" rel="noopener" aria-label="Open all 64 board feature planes at full resolution"><img src="assets/study/board-feature-planes.png" alt="An eight-by-eight grid of chessboards visualizing the 64 feature planes for a position and move." width="1999" height="1999" loading="lazy"></a>
-            <figcaption>Sixty-four ways of seeing the same decision. Select the image to inspect the original.</figcaption>
+            <figcaption>Sixty-four ways of seeing the same decision. Select the image to look closer.</figcaption>
           </figure>
         </section>
 
-        <section class="article-section">
+        <section class="article-section editorial-row belief-section">
           <div class="prose">
-            <p class="section-label">The idea</p>
-            <h2>A belief that moves with the game.</h2>
-            <p>The original prototype combines move-level predictions into an evolving rating distribution. A familiar move may tell us little; a distinctive decision may shift the estimate. The shape of the distribution matters alongside its center.</p>
+            <p class="section-label">The evidence</p>
+            <h2>A belief that moves<br>with the game.</h2>
+            <p>Move-level predictions combine into an evolving rating distribution. A familiar move may tell us little; a distinctive decision may shift the estimate.</p>
+            <p>Following the whole distribution keeps uncertainty in view. Its shape matters alongside its center: how much does this move tell us, and how much remains unknown?</p>
           </div>
-          <details class="replay-detail">
-            <summary>View the original animated replay<span class="plus" aria-hidden="true"></span></summary>
+          <details class="replay-detail" open>
+            <summary>A game, move by move<span class="plus" aria-hidden="true"></span></summary>
             <figure class="replay-figure">
-              <img data-src="assets/study/original-posterior-replay.gif" alt="Original prototype replay of Charles1ee versus Basti1967, with the chessboard and changing rating distributions." width="800" height="1208" loading="lazy">
-              <noscript><a href="assets/study/original-posterior-replay.gif">Open the original replay</a></noscript>
-              <figcaption>The earlier classifier prototype, on a different game from the interactive example. Curves are scaled for display. Close this panel to hide the animation.</figcaption>
+              <img src="assets/study/original-posterior-replay.gif" data-src="assets/study/original-posterior-replay.gif" alt="Replay of Charles1ee versus Basti1967, with the chessboard and the classifier's changing rating distributions." width="800" height="1208" loading="lazy">
+              <noscript><a href="assets/study/original-posterior-replay.gif">Open the animated replay</a></noscript>
+              <figcaption>Charles1ee vs Basti1967. The board and the classifier’s rating distribution unfold together; curves are scaled for display.</figcaption>
             </figure>
           </details>
         </section>
 
         <section class="article-section inverse-section">
+          <div class="inverse-heading">
+            <p class="section-label">The inference</p>
+            <h2>Turn the<br> question around.</h2>
+          </div>
           <div class="prose">
-            <p class="section-label">The next iteration</p>
-            <h2>Turn the question around.</h2>
-            <p>A skill-conditioned move model asks what a player of a given strength would play. The <a href="#example">interactive example</a> reverses that question: which strengths make these observed moves plausible?</p>
+            <p>A complementary route starts with a skill-conditioned move model: what would a player of a given strength play? The <a href="#example">interactive example</a> asks the inverse question—which strengths make these observed moves plausible?</p>
             <div class="equation" aria-label="Updated belief in skill is proportional to prior belief times move likelihood raised to an evidence weight"><span>Updated belief</span><span class="math-symbol">∝</span><span>Prior belief</span><span class="math-symbol">×</span><span>Move likelihood<sup>α</sup></span></div>
-            <p>This newer approach uses <a href="https://www.maiachess.com/">Maia-3</a>’s 5M human-move model and tracks White and Black separately. Evidence is tempered, with a per-move trust cap, to limit how sharply a single decision changes the estimate.</p>
-            <p class="research-note">An exploratory case study: one Chess.com game, evaluated on a Lichess rating scale. The estimates and uncertainty still need validation across players and games; they are not official ratings.</p>
+            <p>Using <a href="https://www.maiachess.com/">Maia-3</a>’s 5M human-move model, it tracks White and Black separately. Evidence is tempered, with a per-move trust cap, so a single decision has limited influence.</p>
+            <p class="research-note">An exploratory case study: one Chess.com game, evaluated on a Lichess rating scale. The estimates and uncertainty need validation across players and games; they are not official ratings.</p>
           </div>
         </section>
 
         <section class="article-section next-question">
+          <blockquote class="chess-quote closing-quote">
+            <p>“The beauty of a move lies not in its appearance, but in the thought behind it.”</p>
+            <cite>Siegbert Tarrasch</cite>
+          </blockquote>
           <div class="prose">
-            <p class="section-label">The research question</p>
-            <h2>What changes when skill improves?</h2>
-            <p>Can we separate persistent competence from style, position difficulty, and time pressure? And can the same approach help measure how an AI’s decisions change through training?</p>
-            <p>A possible next experiment: compare pretrained, supervised, and reinforcement-learned chess models on shared unseen positions. Test whether inferred skill tracks transferable performance, with controls for sampling temperature and model confidence.</p>
-            <p class="research-note">Proposed direction, not a result of this study. Related work: <a href="https://arxiv.org/abs/2607.16097">Understanding Reasoning from Pretraining to Post-Training</a>, Shen et al. (2026).</p>
+            <p class="section-label">Beyond the rating</p>
+            <h2>Understanding the player.</h2>
+            <p>Can we separate persistent skill from style, position difficulty, and time pressure? Adding clock usage and engine-based move quality could help explain where a player’s decisions change—and why.</p>
+            <p>The ambition is to understand what our choices reveal about us, and how that changes as we learn.</p>
             <a class="primary-link" href="#example">Explore the example</a>
           </div>
         </section>

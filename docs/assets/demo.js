@@ -1,6 +1,8 @@
 'use strict';
 
 let index = 12;
+// A final board-only state plays the mating move without adding evidence.
+let finalMovePlayed = false;
 const blue = '#2a6fbb', red = '#a33b3b', ink = '#1d1d1f', muted = '#6e6e73';
 const gridMin = DATA.grid[0], gridMax = DATA.grid[DATA.grid.length - 1];
 const posteriorYMax = Math.ceil(Math.max(...DATA.moves.flatMap(r => r.prior.concat(r.posterior))) * 100) / 100;
@@ -94,30 +96,61 @@ function render() {
   const r = DATA.moves[index];
   const focusedControl = document.activeElement;
   byId('start').disabled = byId('prev').disabled = index === 0;
-  byId('next').disabled = byId('end').disabled = index === DATA.moves.length - 1;
+  byId('next').disabled = byId('end').disabled = finalMovePlayed;
+  const canFinish = index === DATA.moves.length - 1 && !finalMovePlayed;
+  byId('next').querySelector('span').textContent = canFinish ? 'Finish' : 'Next';
+  byId('next').setAttribute('aria-label', canFinish ? 'Play Nf2 checkmate' : 'Next move');
   if (focusedControl instanceof HTMLButtonElement && focusedControl.disabled && focusedControl.closest('.controls')) {
     byId(index === 0 ? 'next' : 'prev').focus({preventScroll: true});
   }
   byId('move-label').textContent = `${r.move_number}${r.side === 'White' ? '.' : '…'} ${r.san}`;
   byId('move-label').setAttribute('aria-label', `Move ${r.move_number}, ${r.side}: ${r.san}`);
-  byId('move-count').textContent = `${index + 1} / ${DATA.moves.length}`;
+  byId('move-count').textContent = finalMovePlayed ? '0–1 · Checkmate' : `${index + 1} / ${DATA.moves.length}`;
   byId('board').innerHTML = r.board_svg;
   byId('board').setAttribute('aria-label', `Position before move ${r.move_number}, ${r.side}: ${r.san}. Arrow from ${r.uci.slice(0, 2)} to ${r.uci.slice(2, 4)}.`);
+  document.documentElement.classList.toggle('game-finished', finalMovePlayed);
+  byId('keyboard-hint').innerHTML = finalMovePlayed
+    ? 'Checkmate. Black wins.<br><span>Use Back to revisit the final move.</span>'
+    : 'Before the move. The arrow shows the choice.<br><span>Use ← → with a navigation button focused.</span>';
+  if (finalMovePlayed) {
+    const board = byId('board');
+    const from = board.querySelector(`rect.square.${r.uci.slice(0, 2)}`);
+    const to = board.querySelector(`rect.square.${r.uci.slice(2, 4)}`);
+    const origin = `translate(${from.getAttribute('x')}, ${from.getAttribute('y')})`;
+    const knight = Array.from(board.querySelectorAll('use')).find(piece => piece.getAttribute('transform') === origin);
+    knight.setAttribute('transform', `translate(${to.getAttribute('x')}, ${to.getAttribute('y')})`);
+    board.querySelectorAll('.arrow').forEach(arrow => arrow.remove());
+    board.querySelector('rect.square.h1').setAttribute('fill', '#d7776b');
+    board.querySelector('desc').textContent = 'Final position after 26… Nf2#. Black wins by checkmate.';
+    board.setAttribute('aria-label', 'Final position after 26… Nf2 checkmate. Black knight on f2; White king on h1 is checkmated. Black wins, 0–1.');
+  }
   byId('estimate-label').textContent = `${r.side}’s estimated skill`;
   byId('summary').innerHTML = `<span class="before">${r.before_mean.toFixed(0)}</span><span class="arrow" aria-label="to">→</span>${r.after_mean.toFixed(0)}`;
   document.documentElement.style.setProperty('--selected', r.color);
   renderCharts();
 }
-byId('start').addEventListener('click', () => { index = 0; render(); });
-byId('prev').addEventListener('click', () => { if (index > 0) { index--; render(); } });
-byId('next').addEventListener('click', () => { if (index < DATA.moves.length - 1) { index++; render(); } });
-byId('end').addEventListener('click', () => { index = DATA.moves.length - 1; render(); });
+function stepForward() {
+  if (finalMovePlayed) return;
+  if (index < DATA.moves.length - 1) index++;
+  else finalMovePlayed = true;
+  render();
+}
+function stepBack() {
+  if (finalMovePlayed) finalMovePlayed = false;
+  else if (index > 0) index--;
+  else return;
+  render();
+}
+byId('start').addEventListener('click', () => { index = 0; finalMovePlayed = false; render(); });
+byId('prev').addEventListener('click', stepBack);
+byId('next').addEventListener('click', stepForward);
+byId('end').addEventListener('click', () => { index = DATA.moves.length - 1; finalMovePlayed = true; render(); });
 document.querySelector('.controls').addEventListener('keydown', event => {
   if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
   if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
     event.preventDefault();
-    const nextIndex = Math.max(0, Math.min(DATA.moves.length - 1, index + (event.key === 'ArrowRight' ? 1 : -1)));
-    if (nextIndex !== index) { index = nextIndex; render(); }
+    if (event.key === 'ArrowRight') stepForward();
+    else stepBack();
   }
 });
 let lastWidth = 0;
